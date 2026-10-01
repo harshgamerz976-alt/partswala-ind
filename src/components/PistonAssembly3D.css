@@ -1,0 +1,103 @@
+@property --engine-period {
+  syntax: "<time>";
+  inherits: true;
+  initial-value: 2.6s;
+}
+
+.header-brand-with-wheel {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: .45rem;
+}
+
+.piston-assembly3d-placeholder {
+  flex: 0 0 50px;
+  height: 64px;
+  width: 50px;
+}
+
+.piston-assembly3d {
+  --engine-period: 2.6s;
+  cursor: pointer;
+  flex: 0 0 50px;
+  height: 64px;
+  outline-offset: 2px;
+  position: relative;
+  touch-action: manipulation;
+  transition: filter .3s ease;
+  width: 50px;
+}
+
+.piston-assembly3d:hover { filter: drop-shadow(0 2px 5px rgba(249, 115, 22, .22)); }
+.piston-assembly3d:focus-visible { outline: 1px solid #f97316; }
+.piston-assembly3d canvas,
+.piston-fallback { display: block; height: 100%; width: 100%; }
+
+.piston-fallback { display: none; inset: 0; position: absolute; }
+.fallback-piston { animation: pistonStroke var(--engine-period) ease-in-out infinite; height: 25px; left: 50%; position: absolute; top: 5px; transform: translateX(-50%); width: 30px; }
+.fallback-crown { background: linear-gradient(180deg, #e2e5e5, #697479); border: 1px solid #c3c9ca; border-radius: 4px 4px 2px 2px; height: 6px; left: 1px; position: absolute; top: 0; width: 28px; }
+.fallback-skirt { background: linear-gradient(90deg, #424b50, #a5afb3 45%, #50595e); border: 1px solid #aeb8bc; border-radius: 1px 1px 4px 4px; height: 16px; left: 3px; position: absolute; top: 5px; width: 24px; }
+.fallback-ring { background: #252c30; border: 1px solid #b5bdc0; height: 2px; left: 3px; position: absolute; width: 24px; }
+.fallback-ring-one { top: 8px; }
+.fallback-ring-two { top: 12px; border-color: #f97316; }
+.fallback-pin { background: #252c30; border: 1px solid #b6bec0; border-radius: 50%; height: 5px; left: 13px; position: absolute; top: 17px; width: 5px; }
+.fallback-blast { height: 20px; left: 50%; opacity: 0; position: absolute; top: 0; transform: translateX(-50%) scale(.45); width: 34px; }
+.fallback-blast i { background: linear-gradient(180deg, #ffd08a, #f97316 70%, rgba(249, 115, 22, 0)); border-radius: 50%; box-shadow: 0 0 6px rgba(249, 115, 22, .8); height: 11px; left: 13px; position: absolute; top: 2px; transform: rotate(0) translateY(-6px); transform-origin: 50% 9px; width: 7px; }
+.fallback-blast i:nth-child(2) { transform: rotate(60deg) translateY(-6px); }
+.fallback-blast i:nth-child(3) { transform: rotate(120deg) translateY(-6px); }
+.fallback-blast i:nth-child(4) { transform: rotate(180deg) translateY(-6px); }
+.fallback-blast i:nth-child(5) { transform: rotate(240deg) translateY(-6px); }
+.fallback-blast i:nth-child(6) { transform: rotate(300deg) translateY(-6px); }
+.fallback-rod { animation: rodRock var(--engine-period) linear infinite; background: linear-gradient(90deg, #566066, #bdc4c6 50%, #4a5358); border: 1px solid #aab3b7; border-radius: 3px; height: 28px; left: calc(50% - 3px); position: absolute; top: 22px; transform-origin: 50% 0; width: 6px; }
+.fallback-rod::before, .fallback-rod::after { background: radial-gradient(circle at 35% 30%, #e2e5e5, #414a4f 68%); border: 1px solid #aeb7ba; border-radius: 50%; content: ""; height: 8px; left: -3px; position: absolute; width: 8px; }
+.fallback-rod::before { top: -3px; }
+.fallback-rod::after { bottom: -4px; }
+.fallback-rod i { background: #f97316; border-radius: 2px; height: 4px; left: 1px; position: absolute; top: 8px; width: 2px; }
+.fallback-crank { animation: crankTurn var(--engine-period) linear infinite; border: 2px solid #687277; border-radius: 50%; bottom: 2px; height: 15px; left: calc(50% - 7px); position: absolute; width: 15px; }
+.fallback-crank::before { background: linear-gradient(90deg, #626c71, #c0c7c9, #545e63); content: ""; height: 20px; left: 4px; position: absolute; top: -4px; width: 3px; }
+.fallback-crank i { background: #f97316; border: 1px solid #fdb27c; border-radius: 50%; height: 5px; left: 3px; position: absolute; top: -1px; width: 5px; }
+
+.piston-assembly3d.is-hovered { --engine-period: 1.1s; }
+.piston-assembly3d.is-revving { --engine-period: .42s; }
+.piston-fallback, .fallback-piston, .fallback-rod, .fallback-crank { transition: --engine-period .38s cubic-bezier(.2, .7, .2, 1); }
+.fallback-blast { animation: pistonUpBlast var(--engine-period) linear infinite; }
+
+@keyframes pistonStroke {
+  0%, 100% { transform: translate(-50%, 0); }
+  50% { transform: translate(-50%, 7px); }
+}
+
+@keyframes rodRock {
+  0%, 50%, 100% { transform: rotate(0); }
+  25% { transform: rotate(-13deg); }
+  75% { transform: rotate(13deg); }
+}
+
+@keyframes crankTurn { to { transform: rotate(360deg); } }
+@keyframes pistonUpBlast {
+  0%, 82%, 100% { opacity: 0; transform: translateX(-50%) scale(.45); }
+  87% { opacity: .98; transform: translateX(-50%) scale(1.12); }
+  92% { opacity: 0; transform: translateX(-50%) scale(1.4); }
+}
+
+@media (max-width: 640px), (pointer: coarse), (prefers-reduced-motion: reduce) {
+  .piston-assembly3d { flex-basis: 44px; height: 56px; width: 44px; }
+  .piston-assembly3d-placeholder { flex-basis: 44px; height: 56px; width: 44px; }
+  .piston-assembly3d canvas { display: none; }
+  .piston-assembly3d .piston-fallback { display: block; }
+}
+
+@media (max-width: 380px) {
+  .piston-assembly3d { flex-basis: 38px; height: 51px; width: 38px; }
+  .piston-assembly3d-placeholder { flex-basis: 38px; height: 51px; width: 38px; }
+  .fallback-piston { transform: translateX(-50%) scale(.9); transform-origin: center top; }
+  .fallback-rod { height: 24px; }
+  .fallback-crank { bottom: 1px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .piston-assembly3d, .piston-fallback, .fallback-piston, .fallback-blast, .fallback-rod, .fallback-crank { animation: none !important; transition: none !important; }
+  .fallback-piston { transform: translateX(-50%); }
+  .fallback-rod { transform: none; }
+}

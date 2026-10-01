@@ -1,0 +1,70 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "hosting": [
+    {
+      "site": "partswalaflutter",
+      "public": "dist",
+      "ignore": [
+        "firebase.json",
+        "**/.*",
+        "**/node_modules/**"
+      ],
+      "headers": [
+        {
+          "source": "**",
+          "headers": [
+            { "key": "Strict-Transport-Security", "value": "max-age=31536000" },
+            { "key": "X-Content-Type-Options", "value": "nosniff" },
+            { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+            { "key": "X-Frame-Options", "value": "DENY" },
+            { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" },
+            {
+              "key": "Content-Security-Policy-Report-Only",
+              "value": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self' https:; script-src 'self' 'unsafe-inline' https://apis.google.com https://www.google.com https://www.gstatic.com https://checkout.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data: https:; connect-src 'self' https: wss:; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://www.google.com https://recaptcha.google.com https://checkout.razorpay.com"
+            }
+          ]
+        }
+      ],
+      "rewrites": [
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
+    },
+    {
+      "site": "partswalaind",
+      "public": "dist",
+      "ignore": [
+        "firebase.json",
+        "**/.*",
+        "**/node_modules/**"
+      ],
+      "headers": [
+        {
+          "source": "**",
+          "headers": [
+            { "key": "Strict-Transport-Security", "value": "max-age=31536000" },
+            { "key": "X-Content-Type-Options", "value": "nosniff" },
+            { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+            { "key": "X-Frame-Options", "value": "DENY" },
+            { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" },
+            {
+              "key": "Content-Security-Policy-Report-Only",
+              "value": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self' https:; script-src 'self' 'unsafe-inline' https://apis.google.com https://www.google.com https://www.gstatic.com https://checkout.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data: https:; connect-src 'self' https: wss:; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://www.google.com https://recaptcha.google.com https://checkout.razorpay.com"
+            }
+          ]
+        }
+      ],
+      "rewrites": [
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
+    }
+  ]
+}

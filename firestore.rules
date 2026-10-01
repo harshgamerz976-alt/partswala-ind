@@ -1,0 +1,196 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.get('admin', false) == true
+        || request.auth.token.get('email', '') in [
+            'kripaldiamond@gmail.com',
+            'harshgamerz976@gmail.com',
+            'partswalaind@gmail.com'
+          ]
+      );
+    }
+
+    function isVendor() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'vendor'
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.vendorStatus == 'approved';
+    }
+
+    function validProductGst(data) {
+      let storePath = /databases/$(database)/documents/settings/store;
+      return exists(storePath)
+        ? data.gstRate == get(storePath).data.get('productGstRate', 18)
+        : data.gstRate == 18;
+    }
+
+    function validSubmissionImages(data) {
+      return data.images is list && data.images.size() > 0 && data.images.size() <= 5;
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /productCosts/{productId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /orderFinance/{orderId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      // phoneVerified / verifiedPhone / phoneVerifiedAt / phoneVerificationMethod are server-owned:
+      // they are written only by the backend after Firebase Phone Auth proves the number.
+      allow create: if isAdmin() || (isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.get('role', 'customer') == 'customer'
+        && request.resource.data.get('isAdmin', false) == false
+        && !request.resource.data.keys().hasAny(['vendorStatus', 'vendorProfile', 'phoneVerified', 'verifiedPhone', 'phoneVerifiedAt', 'phoneVerificationMethod']));
+      allow update: if isAdmin() || (isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.get('role', 'customer') == resource.data.get('role', 'customer')
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['vendorStatus', 'vendorProfile', 'isAdmin', 'phoneVerified', 'verifiedPhone', 'phoneVerifiedAt', 'phoneVerificationMethod']));
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{orderId} {
+      // Order lifecycle (status, inventory restoration, vendor settlements, timeline, refunds,
+      // financial snapshots, audit logs) is mutated only through backend Admin SDK routes.
+      allow create, update, delete: if false;
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+    }
+
+    match /phoneVerificationEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    match /reviews/{reviewId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+  allow read: if settingId == 'assistant' || isAdmin();
+  allow write: if isAdmin() && settingId != 'store';
+}
+
+    match /coupons/{couponId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /couponCampaigns/{code} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /couponCounters/{code} {
+      allow read, write: if false;
+    }
+
+    match /couponUsage/{usageId} {
+      allow read, write: if false;
+    }
+
+    match /sellerSubmissions/{submissionId} {
+      allow create: if isVendor()
+        && request.resource.data.sellerId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && validProductGst(request.resource.data)
+        && request.resource.data.hsn == ''
+        && request.resource.data.weight is number
+        && request.resource.data.weight > 0
+        && request.resource.data.rejectionReason == ''
+        && validSubmissionImages(request.resource.data);
+      allow read: if isAdmin() || (isSignedIn() && resource.data.sellerId == request.auth.uid);
+      allow update: if (isVendor()
+        && resource.data.sellerId == request.auth.uid
+        && (resource.data.status == 'rejected' || resource.data.status == 'Rejected')
+        && request.resource.data.sellerId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && validProductGst(request.resource.data)
+        && request.resource.data.hsn == ''
+        && request.resource.data.weight is number
+        && request.resource.data.weight > 0
+        && request.resource.data.rejectionReason == ''
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'description', 'category', 'brand', 'partNumber', 'mrp', 'price',
+          'stock', 'hsn', 'gstRate', 'compatibility', 'weight', 'dimensions', 'images', 'imageUrl',
+          'vendorName', 'submittedAt', 'resubmittedAt', 'status', 'rejectionReason'
+        ])
+        && validSubmissionImages(request.resource.data));
+      allow delete: if false;
+    }
+
+    match /vendorApplications/{vendorId} {
+      allow create: if isSignedIn()
+        && request.auth.uid == vendorId
+        && request.resource.data.vendorId == request.auth.uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.phone == request.auth.token.phone_number
+        && request.resource.data.businessName is string
+        && request.resource.data.businessName.size() > 0
+        && request.resource.data.ownerName is string
+        && request.resource.data.ownerName.size() > 0
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() > 0
+        && request.resource.data.businessAddress is string
+        && request.resource.data.businessAddress.size() > 0
+        && request.resource.data.city is string
+        && request.resource.data.city.size() > 0
+        && request.resource.data.state is string
+        && request.resource.data.state.size() > 0
+        && request.resource.data.pincode is string
+        && request.resource.data.pincode.matches('^[0-9]{6}$')
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly([
+          'businessName', 'ownerName', 'email', 'phone', 'businessAddress',
+          'city', 'state', 'pincode', 'gstin', 'pan', 'vendorId', 'status',
+          'submittedAt', 'reviewedAt', 'reviewedBy', 'rejectionReason'
+        ]);
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == vendorId);
+      allow update, delete: if false;
+    }
+
+    match /vendorProductLinks/{productId} {
+      allow read: if isAdmin() || (isVendor() && resource.data.vendorId == request.auth.uid);
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /vendorSettlements/{settlementId} {
+      allow read: if isAdmin() || (isVendor() && resource.data.vendorId == request.auth.uid);
+      allow create, update, delete: if false;
+    }
+
+    match /returnRequests/{returnId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create, update, delete: if false;
+    }
+
+    match /adminAuditLogs/{auditId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,149 @@
+.header-brand-with-wheel {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: .45rem;
+}
+
+.truck-wheel3d {
+  cursor: pointer;
+  flex: 0 0 58px;
+  height: 66px;
+  outline-offset: 2px;
+  position: relative;
+  touch-action: manipulation;
+  transition: filter .28s ease, transform .28s ease;
+  width: 58px;
+}
+
+.truck-wheel3d:hover { filter: drop-shadow(0 2px 5px rgba(249, 115, 22, .25)); }
+.truck-wheel3d:focus-visible { outline: 1px solid #f97316; }
+.truck-wheel3d canvas,
+.truck-wheel-fallback { display: block; height: 100%; width: 100%; }
+
+.truck-wheel-fallback {
+  display: none;
+  inset: 0;
+  position: absolute;
+}
+
+.wheel-rotation {
+  animation: truckWheelSpin 12s linear infinite;
+  background:
+    repeating-conic-gradient(from 0deg, #24282a 0deg 8deg, #101214 8deg 14deg);
+  border: 3px solid #090b0c;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 2px #343a3d, 0 1px 5px rgba(0, 0, 0, .65);
+  height: 42px;
+  left: 8px;
+  position: absolute;
+  top: 12px;
+  width: 42px;
+}
+
+.wheel-rim {
+  background: radial-gradient(circle, #596165 0 17%, #141719 18% 30%, #abb3b6 31% 39%, #343a3d 40% 56%, #aeb6b8 57% 65%, #303638 66%);
+  border: 2px solid #aab2b5;
+  border-radius: 50%;
+  height: 28px;
+  left: 4px;
+  position: absolute;
+  top: 4px;
+  width: 28px;
+}
+
+.wheel-spokes { inset: 0; position: absolute; }
+.wheel-spokes i {
+  background: linear-gradient(90deg, #586064, #d5dadb 48%, #697175);
+  border-radius: 2px;
+  height: 12px;
+  left: 10px;
+  position: absolute;
+  top: 2px;
+  transform-origin: 50% 12px;
+  width: 4px;
+}
+.wheel-spokes i:nth-child(2) { transform: rotate(72deg); }
+.wheel-spokes i:nth-child(3) { transform: rotate(144deg); }
+.wheel-spokes i:nth-child(4) { transform: rotate(216deg); }
+.wheel-spokes i:nth-child(5) { transform: rotate(288deg); }
+
+.wheel-hub {
+  background: radial-gradient(circle at 35% 30%, #d7dcdd, #667074 52%, #252a2d 75%);
+  border: 1px solid #c0c7c9;
+  border-radius: 50%;
+  height: 7px;
+  left: 8px;
+  position: absolute;
+  top: 8px;
+  width: 7px;
+}
+
+.wheel-caliper {
+  background: linear-gradient(100deg, #ad4618, #f97316 48%, #c14d16);
+  border: 1px solid #ff9a53;
+  border-radius: 3px 2px 2px 3px;
+  height: 14px;
+  position: absolute;
+  right: 5px;
+  top: 26px;
+  width: 5px;
+}
+
+.truck-wheel3d.is-hovered .wheel-rotation { animation-duration: 7s; }
+.truck-wheel3d.is-revving .wheel-rotation {
+  animation: truckWheelRev 1.2s both;
+}
+
+@keyframes truckWheelSpin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes truckWheelRev {
+  0% { transform: rotate(0deg); animation-timing-function: cubic-bezier(.45, 0, .8, .35); }
+  35% { transform: rotate(900deg); animation-timing-function: cubic-bezier(.12, .62, .3, 1); }
+  100% { transform: rotate(1440deg); }
+}
+
+@media (max-width: 640px), (pointer: coarse), (prefers-reduced-motion: reduce) {
+  .truck-wheel3d {
+    flex-basis: 43px;
+    height: 52px;
+    width: 43px;
+  }
+
+  .truck-wheel3d canvas { display: none; }
+  .truck-wheel3d .truck-wheel-fallback { display: block; }
+  .wheel-rotation { height: 36px; left: 3px; top: 8px; width: 36px; }
+  .wheel-rim { height: 24px; left: 3px; top: 3px; width: 24px; }
+  .wheel-spokes i { height: 10px; left: 8px; top: 2px; transform-origin: 50% 10px; }
+  .wheel-hub { height: 6px; left: 7px; top: 7px; width: 6px; }
+  .wheel-caliper { right: 3px; top: 21px; }
+}
+
+@media (max-width: 380px) {
+  .truck-wheel3d { flex-basis: 35px; height: 46px; width: 35px; }
+  .wheel-rotation { height: 31px; left: 1px; top: 7px; width: 31px; }
+  .wheel-rim { height: 21px; left: 2px; top: 2px; width: 21px; }
+  .wheel-spokes i { height: 8px; left: 7px; top: 2px; transform-origin: 50% 8px; }
+  .wheel-hub { height: 5px; left: 6px; top: 6px; width: 5px; }
+  .wheel-caliper { right: 1px; top: 18px; }
+}
+
+@media (max-width: 360px) {
+  .header-nav { padding-left: .75rem; padding-right: .75rem; }
+  .header-nav > div:first-child > * { margin: 0 !important; }
+  .header-nav > div:last-child { column-gap: .75rem; }
+  .header-nav > div:last-child > * { margin: 0 !important; }
+  .header-brand-with-wheel .truck-wheel3d { display: none; }
+}
+
+@media (max-width: 640px) and (prefers-reduced-motion: no-preference) {
+  .wheel-rotation { animation-duration: 12s; }
+  .truck-wheel3d.is-hovered .wheel-rotation { animation-duration: 7s; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wheel-rotation { animation: none !important; }
+  .truck-wheel3d { transition: none; }
+}
