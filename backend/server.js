@@ -33,6 +33,7 @@ import { adminLifecycleOverrideProblem } from "./adminLifecycle.js";
 import { normalizeFinanceDateRange } from "./financeDateRange.js";
 import { normalizeIndianState, resolveSellerTaxState, validatedDeliveryState } from "./sellerTaxContext.js";
 import { hasValidVendorPickupLocation, normalizeVendorPickupLocation } from "./vendorPickup.js";
+import { registerPublicSettingsRoute } from "./publicSettings.js";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -674,6 +675,7 @@ function normalizeCustomer(payload, user) {
   return customer;
 }
 app.get("/health", (_request, response) => response.json({ ok: true, service: "partswala-ind-backend" }));
+registerPublicSettingsRoute(app, getDb);
 
 app.get("/api/reviews", async (request, response) => {
   const productId = String(request.query.productId || "").trim();
