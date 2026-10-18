@@ -6,6 +6,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test",
+    "test:emulator": "firebase emulators:exec --config ../firebase.json --project demo-partswala-vendor-import --only auth,firestore \"node --test vendorBulkImport.emulator.test.js\"",
     "admin:claim": "node scripts/setAdminClaim.js"
   },
   "dependencies": {
@@ -14,6 +15,11 @@
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "firebase-admin": "^13.5.0",
-    "groq-sdk": "^1.6.0"
+    "groq-sdk": "^1.6.0",
+    "multer": "^2.0.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "firebase-tools": "^15.32.1"
   }
 }

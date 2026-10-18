@@ -165,11 +165,12 @@ export const AuthProvider = ({ children }) => {
   }
 
   async function sendPhoneOtp(phoneNumber) {
-    if (!currentUser) throw new Error("Please sign in before verifying a phone number.");
+    const signedInUser = auth.currentUser;
+    if (!signedInUser) throw new Error("Please sign in before verifying a phone number.");
 
     const expectedPhoneNumber = normalizePhoneForFirebase(phoneNumber);
     if (!expectedPhoneNumber) throw new Error("Enter a valid 10-digit Indian mobile number.");
-    const existingPhoneNumber = normalizePhoneForFirebase(currentUser.phoneNumber || "");
+    const existingPhoneNumber = normalizePhoneForFirebase(signedInUser.phoneNumber || "");
 
     if (existingPhoneNumber && existingPhoneNumber === expectedPhoneNumber) {
       setPhoneConfirmation({ confirmation: null, verifier: null, alreadyLinked: true, phoneNumber: expectedPhoneNumber });
@@ -182,7 +183,7 @@ export const AuthProvider = ({ children }) => {
     const verifier = new RecaptchaVerifier(auth, recaptchaElement, { size: "invisible" });
 
     try {
-      const confirmation = await linkWithPhoneNumber(currentUser, expectedPhoneNumber, verifier);
+      const confirmation = await linkWithPhoneNumber(signedInUser, expectedPhoneNumber, verifier);
       setPhoneConfirmation({ confirmation, verifier, alreadyLinked: false, phoneNumber: expectedPhoneNumber });
     } catch (error) {
       if (error?.code === "auth/provider-already-linked") {
@@ -198,7 +199,7 @@ export const AuthProvider = ({ children }) => {
   async function verifyPhoneOtp(code, phoneNumber) {
     const expectedPhoneNumber = normalizePhoneForFirebase(phoneNumber);
     if (!expectedPhoneNumber) throw new Error("Enter a valid 10-digit Indian mobile number.");
-    const existingPhoneNumber = normalizePhoneForFirebase(currentUser?.phoneNumber || "");
+    const existingPhoneNumber = normalizePhoneForFirebase(auth.currentUser?.phoneNumber || "");
 
     if (phoneConfirmation?.alreadyLinked || (existingPhoneNumber && existingPhoneNumber === expectedPhoneNumber)) {
       await confirmVerifiedPhone(expectedPhoneNumber);

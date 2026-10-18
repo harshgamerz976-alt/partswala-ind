@@ -91,6 +91,17 @@ service cloud.firestore {
   allow write: if isAdmin() && settingId != 'store';
 }
 
+    match /presence/{userId} {
+      allow read: if isAdmin();
+      allow create, update: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['lastSeen', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['lastSeen', 'updatedAt'])
+        && request.resource.data.lastSeen == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isSignedIn() && request.auth.uid == userId;
+    }
+
     match /coupons/{couponId} {
       allow read: if isAdmin();
       allow write: if false;

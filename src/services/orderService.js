@@ -1,5 +1,6 @@
 import { db, auth } from "../firebase";
 import { collection, getDocs, getDoc, doc, query, where, orderBy, onSnapshot, limit, startAfter } from "firebase/firestore";
+import { fetchPublicSiteSettings } from "../../shared/publicSiteSettings.js";
 
 const COL = "orders";
 
@@ -227,4 +228,9 @@ export function reviewAdminVendorApplication(vendorId, status, reason = "") {
 
 export function saveAdminStoreSettings(settings, reason = "Updated store settings") {
   return backendRequest("/api/admin/settings/store", { settings, reason }, "PUT");
+}
+
+export async function getPublicSiteSettings() {
+  const baseUrl = (import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_API_URL || "http://localhost:8787").replace(/\/$/, "");
+  return fetchPublicSiteSettings(baseUrl);
 }

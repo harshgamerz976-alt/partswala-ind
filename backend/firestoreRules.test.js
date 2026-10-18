@@ -79,6 +79,18 @@ test("orderFinance keeps admin read access while denying every write", () => {
   assert.ok(block.includes("allow write: if false;"));
 });
 
+test("presence reads are admin-only and signed-in users can only update their own timestamp record", () => {
+  const presence = compact(matchBlock("presence"));
+  assert.ok(presence.includes("allow read: if isAdmin();"));
+  assert.ok(presence.includes("allow create, update: if isSignedIn() && request.auth.uid == userId"));
+  assert.ok(presence.includes("keys().hasOnly(['lastSeen', 'updatedAt'])"));
+  assert.ok(presence.includes("keys().hasAll(['lastSeen', 'updatedAt'])"));
+  assert.ok(presence.includes("request.resource.data.lastSeen == request.time"));
+  assert.ok(presence.includes("request.resource.data.updatedAt == request.time"));
+  assert.ok(presence.includes("allow delete: if isSignedIn() && request.auth.uid == userId;"));
+  assert.ok(!presence.includes("if true"));
+});
+
 test("unlisted collections remain denied by the catch-all", () => {
   assert.ok(rules.includes("match /{document=**}"));
   assert.ok(/match \/\{document=\*\*\} \{\s*allow read, write: if false;\s*\}/.test(rules));

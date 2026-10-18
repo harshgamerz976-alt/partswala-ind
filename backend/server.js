@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import cors from "cors";
 import express from "express";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
@@ -34,6 +35,16 @@ import { normalizeFinanceDateRange } from "./financeDateRange.js";
 import { normalizeIndianState, resolveSellerTaxState, validatedDeliveryState } from "./sellerTaxContext.js";
 import { hasValidVendorPickupLocation, normalizeVendorPickupLocation } from "./vendorPickup.js";
 import { registerPublicSettingsRoute } from "./publicSettings.js";
+import multer from "multer";
+import {
+  BULK_IMPORT_LIMITS,
+  REQUIRED_IMPORT_COLUMNS,
+  buildVendorImportKey,
+  buildVendorImportUpdate,
+  generateVendorBulkImportWorkbook,
+  parseBulkImportFile,
+  previewVendorBulkImport,
+} from "./vendorBulkImport.js";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -43,6 +54,16 @@ const cloudinaryCredentials = cloudinaryCredentialsFromEnvironment();
 console.info("[Cloudinary] startup configuration:", cloudinaryCredentialPresence(cloudinaryCredentials));
 const reviewLimiter = createRateLimiter({ limit: 5, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
 const reviewReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
+const publicProductContactLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
+const bulkImportUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: BULK_IMPORT_LIMITS.maxFileSize },
+  fileFilter: (_request, file, callback) => {
+    const extension = String(file.originalname || "").split(".").pop()?.toLowerCase() || "";
+    if (["csv", "xlsx", "xls"].includes(extension)) return callback(null, true);
+    callback(new Error("Unsupported file type. Upload a CSV or Excel workbook (.csv, .xlsx, .xls)."));
+  },
+});
 const shiprocketUrl = process.env.SHIPROCKET_API_URL || "https://apiv2.shiprocket.in/v1/external";
 let cachedShiprocketToken = "";
 let shiprocketTokenExpiresAt = 0;
@@ -677,6 +698,34 @@ function normalizeCustomer(payload, user) {
 app.get("/health", (_request, response) => response.json({ ok: true, service: "partswala-ind-backend" }));
 registerPublicSettingsRoute(app, getDb);
 
+app.get("/api/products/:productId/vendor-contact", async (request, response) => {
+  const productId = String(request.params.productId || "").trim();
+  if (!productId || productId.length > 200) return response.status(400).json({ message: "A valid product ID is required." });
+  const limit = publicProductContactLimiter.check(`ip:${resolveClientIp(request)}`);
+  if (!limit.allowed) return response.status(429).json({ message: "Too many contact requests. Try again shortly." });
+  try {
+    const db = getDb();
+    const productSnapshot = await db.collection("products").doc(productId).get();
+    if (!productSnapshot.exists) return response.status(404).json({ message: "Product not found." });
+    const product = productSnapshot.data();
+    if (product.sellerType !== "vendor" || !product.sellerId) return response.json({ whatsAppNumber: null });
+    const vendorSnapshot = await db.collection("users").doc(String(product.sellerId)).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
+    if (!vendorSnapshot.exists || vendor.role !== "vendor" || vendor.vendorStatus !== "approved") return response.json({ whatsAppNumber: null });
+    const vendorProfile = vendor.vendorProfile || {};
+    const publicNumber = product.publicWhatsAppNumber || product.vendorWhatsAppNumber || product.whatsAppNumber || vendorProfile.publicWhatsAppNumber || vendorProfile.whatsAppNumber || "";
+    let digits = String(publicNumber).replace(/\D/g, "");
+    if (digits.length === 10) digits = `91${digits}`;
+    else if (digits.length === 11 && digits.startsWith("0")) digits = `91${digits.slice(1)}`;
+    const isValidIndianNumber = digits.length === 12 && digits.startsWith("91");
+    const isValidInternationalNumber = digits.length >= 8 && digits.length <= 15;
+    return response.json({ whatsAppNumber: isValidIndianNumber || isValidInternationalNumber ? digits : null });
+  } catch (error) {
+    console.error("Public product seller contact could not be loaded:", error?.message || error);
+    return response.status(500).json({ message: "Seller contact information is unavailable." });
+  }
+});
+
 app.get("/api/reviews", async (request, response) => {
   const productId = String(request.query.productId || "").trim();
   if (!productId || productId.length > 200) return response.status(400).json({ message: "A valid product ID is required." });
@@ -784,7 +833,7 @@ app.post("/api/uploads/cloudinary/signature", async (request, response) => {
   if (!user) return;
   const limit = cloudinaryUploadLimiter.check(`uid:${user.uid}`);
   if (!limit.allowed) {
-    return response.status(429).json({ message: `Too many image uploads. Try again in ${Math.max(1, Math.ceil(limit.retryAfterMs / 1000))} seconds.` });
+    return response.status(429).json({ message: `Too many media uploads. Try again in ${Math.max(1, Math.ceil(limit.retryAfterMs / 1000))} seconds.` });
   }
   let role = isAdminUser(user) ? "admin" : "customer";
   if (role === "customer") {
@@ -801,6 +850,7 @@ app.post("/api/uploads/cloudinary/signature", async (request, response) => {
     uid: user.uid,
     role,
     purpose: request.body?.purpose,
+    mediaType: request.body?.mediaType,
     uploadPreset: process.env.CLOUDINARY_UPLOAD_PRESET || "",
   });
   if (signed.status) return response.status(signed.status).json({ message: signed.message, code: signed.code, missingVariables: signed.missingVariables });
@@ -1359,6 +1409,147 @@ app.put("/api/vendor/pickup-location", async (request, response) => {
     return response.json({ pickupLocation });
   } catch (error) {
     return response.status(error.message.startsWith("Complete") ? 400 : error.message === "VENDOR_NOT_APPROVED" ? 403 : 500).json({ message: error.message || "Pickup location could not be saved." });
+  }
+});
+
+app.get("/api/vendor/import-template", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const db = getDb();
+    const vendorSnapshot = await db.collection("users").doc(user.uid).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
+    if (vendor.role !== "vendor" || vendor.vendorStatus !== "approved") {
+      return response.status(403).json({ message: "Approved vendor access is required." });
+    }
+    response.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    response.setHeader("Content-Disposition", "attachment; filename=vendor-product-import-template.xlsx");
+    return response.send(generateVendorBulkImportWorkbook());
+  } catch (error) {
+    console.error("Bulk import template could not be generated:", error);
+    return response.status(500).json({ message: "The import template could not be generated." });
+  }
+});
+
+app.get("/api/vendor/import-jobs", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const db = getDb();
+    const vendorSnapshot = await db.collection("users").doc(user.uid).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
+    if (vendor.role !== "vendor" && !isAdminUser(user)) {
+      return response.status(403).json({ message: "Vendor or admin access required." });
+    }
+    const query = vendor.role === "vendor" && vendor.vendorStatus === "approved"
+      ? db.collection("vendorImportJobs").where("vendorId", "==", user.uid).orderBy("createdAt", "desc").limit(20)
+      : db.collection("vendorImportJobs").orderBy("createdAt", "desc").limit(20);
+    const snapshot = await query.get();
+    return response.json({ jobs: snapshot.docs.map((document) => ({ id: document.id, ...document.data() })) });
+  } catch (error) {
+    console.error("Vendor import history could not be loaded:", error);
+    return response.status(500).json({ message: "Import history could not be loaded." });
+  }
+});
+
+app.post("/api/vendor/import-products", bulkImportUpload.single("file"), async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const file = request.file;
+  if (!file) return response.status(400).json({ message: "A CSV or Excel file is required." });
+  try {
+    const db = getDb();
+    const vendorSnapshot = await db.collection("users").doc(user.uid).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
+    if (vendor.role !== "vendor" || vendor.vendorStatus !== "approved") {
+      return response.status(403).json({ message: "Approved vendor access is required." });
+    }
+    const parsed = parseBulkImportFile(file.buffer, file.originalname);
+    const existingSnapshot = await db.collection("products").where("sellerId", "==", user.uid).get();
+    const existingKeys = existingSnapshot.docs.map((document) => {
+      const product = document.data();
+      return buildVendorImportKey(user.uid, product.partNumber, product.brand);
+    });
+    const preview = previewVendorBulkImport(parsed, user.uid, existingKeys);
+    const confirm = request.body && (request.body.confirm === true || request.body.confirm === "true");
+    if (!confirm) {
+      return response.json({
+        ok: true,
+        totalRows: preview.totalRows,
+        validRows: preview.validRows,
+        invalidRows: preview.invalidRows,
+        duplicates: preview.duplicates,
+        rows: preview.rows,
+        errors: preview.errors,
+        importMode: "preview",
+        requiredColumns: REQUIRED_IMPORT_COLUMNS,
+        reImportBehavior: "Matching part number + brand updates the vendor's existing record; duplicate rows within the same file are still rejected.",
+      });
+    }
+    if (!preview.rows.length) {
+      return response.status(400).json({ message: "No valid rows are ready to import.", summary: preview });
+    }
+    const existingByKey = new Map();
+    for (const snapshot of existingSnapshot.docs) {
+      const data = snapshot.data();
+      existingByKey.set(buildVendorImportKey(user.uid, data.partNumber, data.brand), snapshot.ref);
+    }
+    const imported = [];
+    for (const product of preview.rows) {
+      const existingReference = existingByKey.get(product.vendorImportKey);
+      const productId = `vendor-import-${createHash("sha256").update(product.vendorImportKey).digest("hex")}`;
+      const reference = existingReference || db.collection("products").doc(productId);
+      const result = await db.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(reference);
+        const existingProduct = snapshot.exists ? snapshot.data() : null;
+        if (existingProduct && (
+          existingProduct.sellerId !== user.uid
+          || buildVendorImportKey(user.uid, existingProduct.partNumber, existingProduct.brand) !== product.vendorImportKey
+        )) {
+          throw new Error("IMPORT_PRODUCT_IDENTITY_CONFLICT");
+        }
+        const payload = buildVendorImportUpdate(existingProduct || {}, product, user.uid);
+        if (snapshot.exists) transaction.update(reference, payload);
+        else transaction.create(reference, payload);
+        return { id: reference.id, updateExisting: Boolean(existingProduct) };
+      });
+      imported.push({ ...result, partNumber: product.partNumber, brand: product.brand });
+      existingByKey.set(product.vendorImportKey, reference);
+    }
+    const jobId = `vendor-import-${createHash("sha256").update(user.uid).update("\0").update(file.buffer).digest("hex")}`;
+    const jobRef = db.collection("vendorImportJobs").doc(jobId);
+    const timestamp = new Date().toISOString();
+    const summary = { totalRows: preview.totalRows, validRows: preview.validRows, invalidRows: preview.invalidRows, duplicates: preview.duplicates, imported: imported.length };
+    await jobRef.set({
+      vendorId: user.uid,
+      fileName: file.originalname,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      status: "completed",
+      summary,
+      records: imported,
+    });
+    return response.status(201).json({
+      ok: true,
+      importMode: "confirmed",
+      jobId: jobRef.id,
+      summary,
+      imported,
+      warnings: preview.errors.filter((entry) => entry.errors.length > 0).slice(0, 20),
+    });
+  } catch (error) {
+    const message = error.message || "Bulk import could not be processed.";
+    if (message === "IMPORT_PRODUCT_IDENTITY_CONFLICT") {
+      return response.status(409).json({ message: "A product identity conflict prevented this import. Refresh the preview and try again." });
+    }
+    if (message.includes("Unsupported file type") || message.includes("empty") || message.includes("row limit") || message.includes("column count") || message.includes("required header") || message.includes("worksheet") || message.includes("no valid product rows")) {
+      return response.status(400).json({ message });
+    }
+    if (message.includes("Malicious spreadsheet content")) {
+      return response.status(400).json({ message });
+    }
+    console.error("Vendor bulk import failed:", error);
+    return response.status(500).json({ message: "Bulk import could not be processed." });
   }
 });
 
@@ -3736,4 +3927,8 @@ app.post("/api/ai/chat", async (request, response) => {
   }
 });
 
-app.listen(port, "0.0.0.0", () => console.log(`Partswala backend listening on http://localhost:${port}`));
+export default app;
+
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  app.listen(port, "0.0.0.0", () => console.log(`Partswala backend listening on http://localhost:${port}`));
+}
