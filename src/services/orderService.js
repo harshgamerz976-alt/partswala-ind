@@ -218,6 +218,14 @@ export function setAdminProductEnabled(productId, enabled) {
   return backendRequest(`/api/admin/products/${encodeURIComponent(productId)}/enabled`, { enabled }, "PATCH");
 }
 
+export function getPendingAdminVendorProducts() {
+  return backendRequest("/api/admin/products/pending-vendor", undefined, "GET");
+}
+
+export function approveSelectedAdminVendorProducts(productIds) {
+  return backendRequest("/api/admin/products/approve-selected", { productIds });
+}
+
 export function reviewAdminVendorSubmission(submissionId, status, reason = "") {
   return backendRequest(`/api/admin/vendor-submissions/${encodeURIComponent(submissionId)}`, { status, reason }, "PATCH");
 }

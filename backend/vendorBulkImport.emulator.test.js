@@ -45,9 +45,11 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
   assert.equal(firebaseApp.options.projectId, projectId);
   const { default: app } = await import("./server.js");
   const { getFirestore } = await import("firebase-admin/firestore");
+  const { getAuth } = await import("firebase-admin/auth");
   const database = getFirestore(getApp());
   const createdAccounts = [];
   const createdVendorIds = [];
+  const createdProductIds = [];
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
@@ -68,6 +70,32 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
     createdVendorIds.push(account.localId);
     await database.collection("users").doc(account.localId).set({ role: "vendor", vendorStatus: status });
     return { uid: account.localId, token: account.idToken };
+  }
+
+  async function createAdmin() {
+    const email = `admin-${randomUUID()}@example.test`;
+    const account = await emulatorRequest(
+      authHost,
+      `/identitytoolkit.googleapis.com/v1/accounts:signUp?key=local-emulator-key`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: "LocalEmulatorPass123!", returnSecureToken: true }),
+      },
+    );
+    createdVendorIds.push(account.localId);
+    await getAuth(getApp()).setCustomUserClaims(account.localId, { admin: true });
+    const signedIn = await emulatorRequest(
+      authHost,
+      `/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=local-emulator-key`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: "LocalEmulatorPass123!", returnSecureToken: true }),
+      },
+    );
+    createdAccounts.push(signedIn.idToken);
+    return { uid: account.localId, token: signedIn.idToken };
   }
 
   async function importFile(vendor, workbook, confirm = true, claimedVendorId = "") {
@@ -99,7 +127,7 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
   };
 
   async function deleteVendorData() {
-    const references = [];
+    const references = createdProductIds.map((productId) => database.collection("products").doc(productId));
     for (const uid of createdVendorIds) {
       const [products, jobs] = await Promise.all([
         database.collection("products").where("sellerId", "==", uid).get(),
@@ -245,6 +273,71 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       const products = await database.collection("products").where("sellerId", "==", vendor.uid).get();
       assert.equal(products.size, 1);
       assert.equal(products.docs[0].data().vendorImportKey, `${vendor.uid.toLowerCase()}|concurrent-100|acme`);
+    });
+    await t.test("selected approval is bounded and publishes only selected pending vendor products", async () => {
+      const vendor = await createVendor();
+      const admin = await createAdmin();
+      const pendingProduct = database.collection("products").doc(`approval-${randomUUID()}`);
+      const pendingNonVendorProduct = database.collection("products").doc(`approval-non-vendor-${randomUUID()}`);
+      createdProductIds.push(pendingProduct.id, pendingNonVendorProduct.id);
+      await Promise.all([
+        pendingProduct.set({ name: "Approval test part", partNumber: "APPROVAL-1", brand: "Acme", sellerId: vendor.uid, sellerType: "vendor", enabled: false, status: "pending" }),
+        pendingNonVendorProduct.set({ name: "Store pending part", sellerId: "partswala", sellerType: "partswala", enabled: false, status: "pending" }),
+        database.collection("users").doc(vendor.uid).set({ role: "vendor", vendorStatus: "approved", vendorProfile: { businessName: "Approval Test Business" } }),
+      ]);
+      const unauthorizedListResponse = await fetch(`${api}/api/admin/products/pending-vendor`);
+      assert.equal(unauthorizedListResponse.status, 401);
+
+      const vendorListResponse = await fetch(`${api}/api/admin/products/pending-vendor`, {
+        headers: { Authorization: ["Bearer", vendor.token].join(" ") },
+      });
+      assert.equal(vendorListResponse.status, 403);
+
+      const listResponse = await fetch(`${api}/api/admin/products/pending-vendor`, {
+        headers: { Authorization: ["Bearer", admin.token].join(" ") },
+      });
+      assert.equal(listResponse.status, 200);
+      const pendingList = await listResponse.json();
+      const listedProduct = pendingList.products.find((product) => product.id === pendingProduct.id);
+      assert.equal(listedProduct.businessName, "Approval Test Business");
+      assert.equal(pendingList.products.some((product) => product.id === pendingNonVendorProduct.id), false);
+
+      const invalidCountResponse = await fetch(`${api}/api/admin/products/approve-selected`, {
+        method: "POST",
+        headers: { Authorization: ["Bearer", admin.token].join(" "), "Content-Type": "application/json" },
+        body: JSON.stringify({ productIds: Array.from({ length: 51 }, (_, index) => `product-${index}`) }),
+      });
+      assert.equal(invalidCountResponse.status, 400);
+
+      const vendorDeniedResponse = await fetch(`${api}/api/admin/products/approve-selected`, {
+        method: "POST",
+        headers: { Authorization: ["Bearer", vendor.token].join(" "), "Content-Type": "application/json" },
+        body: JSON.stringify({ productIds: [pendingProduct.id] }),
+      });
+      assert.equal(vendorDeniedResponse.status, 403);
+
+      const response = await fetch(`${api}/api/admin/products/approve-selected`, {
+        method: "POST",
+        headers: { Authorization: ["Bearer", admin.token].join(" "), "Content-Type": "application/json" },
+        body: JSON.stringify({ productIds: [pendingProduct.id] }),
+      });
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.equal(result.approved.length, 1);
+      const approvedSnapshot = await database.collection("products").doc(result.approved[0].product.id).get();
+      assert.equal(approvedSnapshot.data().sellerType, "vendor");
+      assert.equal(approvedSnapshot.data().status, "Available");
+      assert.equal(approvedSnapshot.data().enabled, true);
+      assert.equal(approvedSnapshot.data().vendorName, "Approval Test Business");
+      assert.equal(approvedSnapshot.data().vendorBusinessName, "Approval Test Business");
+      assert.equal((await pendingNonVendorProduct.get()).data().status, "pending");
+
+      const unauthenticatedResponse = await fetch(`${api}/api/admin/products/approve-selected`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productIds: [pendingProduct.id] }),
+      });
+      assert.equal(unauthenticatedResponse.status, 401);
     });
   } finally {
     try {

@@ -1775,6 +1775,132 @@ app.patch("/api/admin/products/:productId/enabled", async (request, response) =>
   }
 });
 
+app.get("/api/admin/products/pending-vendor", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
+
+  try {
+    const db = getDb();
+    const pendingSnapshot = await db.collection("products").where("status", "==", "pending").get();
+    const candidates = pendingSnapshot.docs.filter((snapshot) => {
+      const product = snapshot.data();
+      return product.sellerType === "vendor" && typeof product.sellerId === "string" && product.sellerId.trim();
+    });
+
+    const vendorIds = [...new Set(candidates.map((snapshot) => snapshot.data().sellerId))];
+    const vendors = new Map();
+    for (let index = 0; index < vendorIds.length; index += 300) {
+      const references = vendorIds.slice(index, index + 300).map((vendorId) => db.collection("users").doc(vendorId));
+      const snapshots = await db.getAll(...references);
+      snapshots.forEach((snapshot) => vendors.set(snapshot.id, snapshot.exists ? snapshot.data() : null));
+    }
+
+    const pendingProducts = candidates.flatMap((snapshot) => {
+      const product = snapshot.data();
+      const vendor = vendors.get(product.sellerId);
+      if (vendor?.role !== "vendor" || vendor.vendorStatus !== "approved") return [];
+      const businessName = String(vendor.vendorProfile?.businessName || vendor.displayName || "").trim();
+      return [{
+        id: snapshot.id,
+        name: typeof product.name === "string" ? product.name : "",
+        partNumber: typeof product.partNumber === "string" ? product.partNumber : "",
+        brand: typeof product.brand === "string" ? product.brand : "",
+        sellerId: product.sellerId,
+        businessName,
+      }];
+    });
+    return response.json({
+      products: pendingProducts,
+      count: pendingProducts.length,
+      blockedVendorCount: candidates.length - pendingProducts.length,
+    });
+  } catch (error) {
+    console.error("Pending vendor products could not be loaded:", error);
+    return response.status(500).json({ message: error.message || "Pending vendor products could not be loaded." });
+  }
+});
+
+app.post("/api/admin/products/approve-selected", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
+
+  const productIds = request.body?.productIds;
+  if (!Array.isArray(productIds) || productIds.length < 1 || productIds.length > 50
+    || productIds.some((productId) => typeof productId !== "string" || !productId.trim() || productId.length > 200)
+    || new Set(productIds).size !== productIds.length) {
+    return response.status(400).json({ message: "Select between 1 and 50 unique product IDs per approval request." });
+  }
+
+  try {
+    const db = getDb();
+    const approved = [];
+    const skipped = [];
+    for (const productId of productIds) {
+      const productRef = db.collection("products").doc(productId);
+      const timestamp = new Date().toISOString();
+      try {
+        const result = await db.runTransaction(async (transaction) => {
+          const latestSnapshot = await transaction.get(productRef);
+          if (!latestSnapshot.exists) return { skipped: "Product no longer exists." };
+          const product = latestSnapshot.data();
+          if (product.status !== "pending" || product.sellerType !== "vendor" || typeof product.sellerId !== "string" || !product.sellerId.trim()) {
+            return { skipped: "Product is no longer pending vendor review." };
+          }
+
+          const vendorRef = db.collection("users").doc(product.sellerId);
+          const vendorSnapshot = await transaction.get(vendorRef);
+          const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
+          if (vendor.role !== "vendor" || vendor.vendorStatus !== "approved") {
+            return { skipped: "The product's vendor is not currently approved." };
+          }
+
+          const businessName = String(vendor.vendorProfile?.businessName || vendor.displayName || "").trim();
+          transaction.update(productRef, {
+            enabled: true,
+            status: "Available",
+            ...(businessName ? { vendorName: businessName, vendorBusinessName: businessName } : {}),
+            updatedAt: timestamp,
+          });
+          stageAdminAudit(transaction, db, user, {
+            action: "product_enabled",
+            entityType: "product",
+            entityId: productRef.id,
+            oldValue: { enabled: typeof product.enabled === "boolean" ? product.enabled : null, status: product.status },
+            newValue: { enabled: true, status: "Available" },
+            reason: "Admin selected vendor product approval",
+            timestamp,
+          });
+          return {
+            product: {
+              id: productRef.id,
+              name: typeof product.name === "string" ? product.name : "",
+              partNumber: typeof product.partNumber === "string" ? product.partNumber : "",
+              brand: typeof product.brand === "string" ? product.brand : "",
+            },
+            businessName,
+          };
+        });
+        if (result.skipped) skipped.push({ productId: productRef.id, reason: result.skipped });
+        else approved.push(result);
+      } catch (error) {
+        skipped.push({ productId: productRef.id, reason: error.message || "Approval failed unexpectedly." });
+      }
+    }
+
+    return response.json({
+      ok: true,
+      requestedCount: productIds.length,
+      approved,
+      skipped,
+    });
+  } catch (error) {
+    console.error("Selected vendor product approval failed:", error);
+    return response.status(500).json({ message: error.message || "Selected vendor products could not be approved." });
+  }
+});
+
 app.patch("/api/admin/vendor-submissions/:submissionId", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;

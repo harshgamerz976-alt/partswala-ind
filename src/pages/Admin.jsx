@@ -5,7 +5,7 @@ import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/useAuth";
 import { db } from "../firebase";
 import { getAdminProductsPage, getAdminRecordsPage, getAdminUsersPage } from "../services/adminService";
-import { completeManualAdminRefund, deleteAdminProduct, getAdminFinance, getAdminFinanceDetails, getAdminOrdersPage, getAdminPickupLocations, ORDER_STATUSES, reconcileAdminCodCollection, requestAdminRefund, retryShiprocketOrder, reviewAdminInvoice, reviewAdminVendorApplication, reviewAdminVendorSubmission, reviewOrderReturn, saveAdminProduct, saveAdminStoreSettings, setAdminPickupLocationStatus, setAdminProductEnabled, subscribeToAllOrders, updateAdminOrderFinance, updateOrderStatus } from "../services/orderService";
+import { approveSelectedAdminVendorProducts, completeManualAdminRefund, deleteAdminProduct, getAdminFinance, getAdminFinanceDetails, getAdminOrdersPage, getAdminPickupLocations, getPendingAdminVendorProducts, ORDER_STATUSES, reconcileAdminCodCollection, requestAdminRefund, retryShiprocketOrder, reviewAdminInvoice, reviewAdminVendorApplication, reviewAdminVendorSubmission, reviewOrderReturn, saveAdminProduct, saveAdminStoreSettings, setAdminPickupLocationStatus, setAdminProductEnabled, subscribeToAllOrders, updateAdminOrderFinance, updateOrderStatus } from "../services/orderService";
 import { needsAccountingReview } from "../services/invoicePolicy";
 import { uploadImageToCloudinary } from "../services/cloudinaryService";
 import ShippingEstimateCard from "../components/ShippingEstimateCard";
@@ -97,6 +97,14 @@ export default function Admin() {
   const [saving, setSaving] = useState(false);
   const [retryingOrderId, setRetryingOrderId] = useState("");
   const [approvingSubmissionId, setApprovingSubmissionId] = useState("");
+  const [pendingApprovalProducts, setPendingApprovalProducts] = useState([]);
+  const [selectedApprovalIds, setSelectedApprovalIds] = useState([]);
+  const [approvalSelectionOpen, setApprovalSelectionOpen] = useState(false);
+  const [loadingPendingApproval, setLoadingPendingApproval] = useState(false);
+  const [approvingSelected, setApprovingSelected] = useState(false);
+  const [approvalProgress, setApprovalProgress] = useState({ completed: 0, total: 0 });
+  const [approvalError, setApprovalError] = useState("");
+  const [approvalResult, setApprovalResult] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [orderFilter, setOrderFilter] = useState("All");
   const [productModal, setProductModal] = useState(false);
@@ -420,6 +428,66 @@ export default function Admin() {
     setProducts((previous) => previous.map((item) => item.id === product.id ? { ...item, enabled, status: enabled ? "Available" : "Disabled" } : item));
   }
 
+  async function loadPendingApprovalProducts() {
+    setLoadingPendingApproval(true);
+    setApprovalError("");
+    try {
+      const result = await getPendingAdminVendorProducts();
+      setPendingApprovalProducts(result.products || []);
+      setSelectedApprovalIds([]);
+      setApprovalSelectionOpen(true);
+    } catch (error) {
+      const message = error.message || "Pending vendor products could not be loaded.";
+      setApprovalError(message);
+      showToast?.(message, "error");
+    } finally {
+      setLoadingPendingApproval(false);
+    }
+  }
+
+  function toggleApprovalSelection(productId) {
+    setSelectedApprovalIds((previous) => previous.includes(productId)
+      ? previous.filter((id) => id !== productId)
+      : [...previous, productId]);
+  }
+
+  async function approveSelectedProducts() {
+    if (!selectedApprovalIds.length || approvingSelected) return;
+    const ids = [...selectedApprovalIds];
+    const combinedResult = { requestedCount: ids.length, approved: [], skipped: [], remainingEligibleNotAttempted: 0 };
+    setApprovingSelected(true);
+    setApprovalError("");
+    setApprovalProgress({ completed: 0, total: ids.length });
+
+    try {
+      for (let offset = 0; offset < ids.length; offset += 50) {
+        const batchIds = ids.slice(offset, offset + 50);
+        try {
+          const result = await approveSelectedAdminVendorProducts(batchIds);
+          combinedResult.approved.push(...result.approved);
+          combinedResult.skipped.push(...result.skipped);
+          setApprovalProgress({ completed: offset + batchIds.length, total: ids.length });
+        } catch (error) {
+          combinedResult.skipped.push(...batchIds.map((productId) => ({
+            productId,
+            reason: `Approval request failed; status may need verification: ${error.message || "request failed"}`,
+          })));
+          combinedResult.remainingEligibleNotAttempted = ids.length - offset - batchIds.length;
+          break;
+        }
+      }
+      const approvedById = new Map(combinedResult.approved.map(({ product, businessName }) => [product.id, { ...product, vendorName: businessName || undefined, vendorBusinessName: businessName || undefined }]));
+      setProducts((previous) => previous.map((product) => {
+        const approved = approvedById.get(product.id);
+        return approved ? { ...product, ...approved, enabled: true, status: "Available" } : product;
+      }));
+      setApprovalResult(combinedResult);
+      setApprovalSelectionOpen(false);
+    } finally {
+      setApprovingSelected(false);
+    }
+  }
+
   async function updateOrder(order, status) {
     await updateOrderStatus(order.id, status);
     setOrders((previous) => previous.map((item) => item.id === order.id ? { ...item, status, orderStatus: status } : item));
@@ -538,7 +606,7 @@ export default function Admin() {
       <section className="admin-main">
         <header className="admin-topbar"><div><p>OPERATIONS / {section.toUpperCase()}</p><h1>{NAV_ITEMS.find(([key]) => key === section)?.[1]}</h1></div><span className="admin-user"><i /> {currentUser.email}</span></header>
         {section === "dashboard" && <Dashboard metrics={metrics} products={products} orders={orders} />}
-        {section === "products" && <ProductsSection products={filteredProducts} searchQuery={searchQuery} setSearchQuery={setSearchQuery} openProduct={openProduct} toggleProduct={toggleProduct} removeProduct={removeProduct} onRefresh={loadData} loadMore={loadMoreProducts} hasMore={hasMoreProducts} loadingMore={loadingMoreProducts} />}
+        {section === "products" && <ProductsSection products={filteredProducts} searchQuery={searchQuery} setSearchQuery={setSearchQuery} openProduct={openProduct} toggleProduct={toggleProduct} removeProduct={removeProduct} onRefresh={loadData} loadMore={loadMoreProducts} hasMore={hasMoreProducts} loadingMore={loadingMoreProducts} loadPendingApproval={loadPendingApprovalProducts} loadingPendingApproval={loadingPendingApproval} approvalError={approvalError} />}
         {section === "orders" && <OrdersSection orders={filteredOrders} filter={orderFilter} setFilter={setOrderFilter} updateOrder={updateOrder} reconcileCodOrder={reconcileCodOrder} retryOrder={retryShipping} retryingOrderId={retryingOrderId} loadMore={loadMoreOrders} hasMore={hasMoreOrders} loadingMore={loadingMoreOrders} />}
         {section === "returns" && <><ReturnsSection requests={returnRequests} review={updateReturnRequest} />{adminRecordPages.returns.hasMore && <div className="admin-content"><button className="admin-secondary" disabled={loadingAdminRecord === "returns"} onClick={() => loadMoreAdminRecords("returns")}>{loadingAdminRecord === "returns" ? "Loading returns..." : "Load older returns"}</button></div>}</>}
         {section === "customers" && <CustomersSection customers={filteredCustomers} searchQuery={searchQuery} setSearchQuery={setSearchQuery} orders={orders} loadMore={loadMoreCustomers} hasMore={hasMoreCustomers} loadingMore={loadingMoreCustomers} />}
@@ -551,6 +619,8 @@ export default function Admin() {
         {section === "assistant" && <AssistantSettingsSection settings={assistantSettings} setSettings={setAssistantSettings} save={saveAssistantSettings} />}
       </section>
       {productModal && <ProductModal product={productForm} setProduct={setProductForm} setImage={setProductImage} categories={categoryOptions} saving={saving} editing={Boolean(editingProduct)} gstRate={Number(settings.productGstRate ?? 18)} save={saveProduct} close={() => setProductModal(false)} />}
+      {approvalSelectionOpen && <PendingApprovalModal products={pendingApprovalProducts} selectedIds={selectedApprovalIds} toggle={toggleApprovalSelection} setSelectedIds={setSelectedApprovalIds} approve={approveSelectedProducts} approving={approvingSelected} progress={approvalProgress} close={() => setApprovalSelectionOpen(false)} />}
+      {approvalResult && <ApprovalResultModal result={approvalResult} close={() => setApprovalResult(null)} />}
     </main>
   );
 }
@@ -566,8 +636,48 @@ function Dashboard({ metrics, products, orders }) {
   return <div className="admin-content"><div className="admin-metric-grid">{cards.map(([label, value, Icon]) => <div className="admin-metric" key={label}><span><Icon size={17} /></span><small>{label}</small><strong>{value}</strong></div>)}</div><div className="admin-dashboard-grid"><div className="admin-panel"><div className="admin-panel-heading"><h2>Recent orders</h2><span>{orders.length} loaded</span></div>{orders.slice(0, 6).map((order) => <div className="admin-mini-row" key={order.id}><div><strong>#{order.id.slice(0, 8).toUpperCase()}</strong><small>{order.customer?.fullName || order.customerName || "Customer"}</small></div><b>{money(order.totalAmount ?? order.total)}</b><em className={`admin-status ${statusFor(order).toLowerCase()}`}>{statusFor(order)}</em></div>)}{orders.length === 0 && <p className="admin-muted">No orders yet.</p>}</div><div className="admin-panel"><div className="admin-panel-heading"><h2>Stock watch</h2><span>{products.filter((product) => Number(product.stock || 0) <= 5).length} loaded items</span></div>{products.filter((product) => Number(product.stock || 0) <= 5).slice(0, 7).map((product) => <div className="admin-mini-row" key={product.id}><div><strong>{product.name}</strong><small>{product.partNumber || product.category}</small></div><b className="admin-stock-low">{product.stock || 0} left</b></div>)}{products.filter((product) => Number(product.stock || 0) <= 5).length === 0 && <p className="admin-muted">No low-stock items in the loaded products.</p>}</div></div></div>;
 }
 
-function ProductsSection({ products, searchQuery, setSearchQuery, openProduct, toggleProduct, removeProduct, loadMore, hasMore, loadingMore }) {
-  return <div className="admin-content"><div className="admin-section-toolbar"><label className="admin-search"><Search size={15} /><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search loaded products" /></label><button className="admin-primary" onClick={() => openProduct()}><Plus size={16} /> Add product</button></div><div className="admin-panel admin-table-panel"><div className="admin-table admin-product-table"><div className="admin-table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span>Actions</span></div>{products.map((product) => <div className="admin-table-row" key={product.id}><div className="admin-product-cell"><div className="admin-product-image">{product.imageUrl ? <img src={product.imageUrl} alt="" /> : <ImagePlus size={16} />}</div><span><strong>{product.name}</strong><small>{product.partNumber || product.brand || "No part number"}</small></span></div><span>{product.category || "Other"}</span><strong>{money(product.price)}</strong><span className={Number(product.stock || 0) <= 5 ? "admin-stock-low" : ""}>{product.stock || 0}</span><em className={`admin-status ${product.enabled === false || product.status === "Disabled" ? "disabled" : "available"}`}>{product.enabled === false || product.status === "Disabled" ? "Disabled" : "Enabled"}</em><div className="admin-actions"><button onClick={() => toggleProduct(product)} title="Enable or disable"><Check size={15} /></button><button onClick={() => openProduct(product)} title="Edit"><Edit3 size={15} /></button><button onClick={() => removeProduct(product)} title="Delete"><Trash2 size={15} /></button></div></div>)}</div>{products.length === 0 && <p className="admin-muted">No products match this search.</p>}{hasMore && <div className="admin-section-toolbar"><button className="admin-secondary" onClick={loadMore} disabled={loadingMore}>{loadingMore ? "Loading products..." : "Load more products"}</button></div>}</div></div>;
+function ProductsSection({ products, searchQuery, setSearchQuery, openProduct, toggleProduct, removeProduct, loadMore, hasMore, loadingMore, loadPendingApproval, loadingPendingApproval, approvalError }) {
+  return <div className="admin-content"><div className="admin-section-toolbar"><label className="admin-search"><Search size={15} /><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search loaded products" /></label><button className="admin-secondary" type="button" onClick={loadPendingApproval} disabled={loadingPendingApproval}>{loadingPendingApproval ? "Loading pending products..." : "Select products to approve"}</button><button className="admin-primary" onClick={() => openProduct()}><Plus size={16} /> Add product</button></div>{approvalError && <p className="admin-bulk-approval-error" role="alert">{approvalError}</p>}<div className="admin-panel admin-table-panel"><div className="admin-table admin-product-table"><div className="admin-table-head"><span>Product</span><span>Category</span><span>Price</span><span>Stock</span><span>Status</span><span>Actions</span></div>{products.map((product) => <div className="admin-table-row" key={product.id}><div className="admin-product-cell"><div className="admin-product-image">{product.imageUrl ? <img src={product.imageUrl} alt="" /> : <ImagePlus size={16} />}</div><span><strong>{product.name}</strong><small>{product.partNumber || product.brand || "No part number"}</small></span></div><span>{product.category || "Other"}</span><strong>{money(product.price)}</strong><span className={Number(product.stock || 0) <= 5 ? "admin-stock-low" : ""}>{product.stock || 0}</span><em className={`admin-status ${product.enabled === false || product.status === "Disabled" ? "disabled" : "available"}`}>{product.enabled === false || product.status === "Disabled" ? "Disabled" : "Enabled"}</em><div className="admin-actions"><button onClick={() => toggleProduct(product)} title="Enable or disable"><Check size={15} /></button><button onClick={() => openProduct(product)} title="Edit"><Edit3 size={15} /></button><button onClick={() => removeProduct(product)} title="Delete"><Trash2 size={15} /></button></div></div>)}</div>{products.length === 0 && <p className="admin-muted">No products match this search.</p>}{hasMore && <div className="admin-section-toolbar"><button className="admin-secondary" onClick={loadMore} disabled={loadingMore}>{loadingMore ? "Loading products..." : "Load more products"}</button></div>}</div></div>;
+}
+
+function PendingApprovalModal({ products, selectedIds, toggle, setSelectedIds, approve, approving, progress, close }) {
+  const allSelected = products.length > 0 && selectedIds.length === products.length;
+  return (
+    <div className="admin-modal-backdrop">
+      <section className="admin-modal admin-approval-modal" role="dialog" aria-modal="true" aria-labelledby="pending-approval-title">
+        <header><div><p>VENDOR PRODUCT REVIEW</p><h2 id="pending-approval-title">Select pending products</h2></div></header>
+        <div className="admin-approval-toolbar">
+          <label><input type="checkbox" checked={allSelected} disabled={approving || products.length === 0} onChange={(event) => setSelectedIds(event.target.checked ? products.map((product) => product.id) : [])} /> Select all {products.length} products</label>
+          <span>{selectedIds.length} selected</span>
+        </div>
+        {products.length === 0 ? <p className="admin-muted">No pending vendor products from approved vendors were found.</p> : (
+          <div className="admin-approval-list">
+            {products.map((product) => <label className="admin-approval-select-row" key={product.id}>
+              <input type="checkbox" checked={selectedIds.includes(product.id)} disabled={approving} onChange={() => toggle(product.id)} />
+              <span><strong>{product.name || "Unnamed product"}</strong><small>{[product.partNumber, product.brand, product.businessName].filter(Boolean).join(" · ") || `Product ID ${product.id}`}</small></span>
+            </label>)}
+          </div>
+        )}
+        {approving && <p className="admin-muted" role="status">Approving {progress.completed} of {progress.total} selected products…</p>}
+        <footer><button className="admin-secondary" type="button" onClick={close} disabled={approving}>Cancel</button><button className="admin-primary" type="button" onClick={approve} disabled={approving || !selectedIds.length}>{approving ? "Approving selected…" : `Approve ${selectedIds.length} selected`}</button></footer>
+      </section>
+    </div>
+  );
+}
+
+function ApprovalResultModal({ result, close }) {
+  return (
+    <div className="admin-modal-backdrop">
+      <section className="admin-modal admin-approval-modal" role="dialog" aria-modal="true" aria-labelledby="approval-result-title">
+        <header><div><p>VENDOR PRODUCT REVIEW</p><h2 id="approval-result-title">Approval complete</h2></div></header>
+        <p className="admin-muted">Approved {result.approved.length} of {result.requestedCount} selected products.</p>
+        {result.approved.length > 0 ? <div className="admin-approval-list">{result.approved.map(({ product, businessName }) => <div key={product.id}><strong>{product.name || "Unnamed product"}</strong><small>{[product.partNumber, product.brand, businessName].filter(Boolean).join(" · ") || `Product ID ${product.id}`}</small></div>)}</div> : <p className="admin-muted">No products were approved. Check the skipped reasons below and try again.</p>}
+        {result.skipped.length > 0 && <details className="admin-approval-skipped"><summary>{result.skipped.length} item(s) skipped or failed</summary><ul>{result.skipped.map((item) => <li key={item.productId}><span>{item.productId}</span> — {item.reason}</li>)}</ul></details>}
+        {result.remainingEligibleNotAttempted > 0 && <p className="admin-muted">{result.remainingEligibleNotAttempted} other pending vendor product(s) were not processed.</p>}
+        <footer><button className="admin-primary" onClick={close}>Done</button></footer>
+      </section>
+    </div>
+  );
 }
 
 function OrdersSection({ orders, filter, setFilter, updateOrder, reconcileCodOrder, retryOrder, retryingOrderId, loadMore, hasMore, loadingMore }) {

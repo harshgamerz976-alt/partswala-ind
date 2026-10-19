@@ -844,6 +844,21 @@ body {
 .admin-file-field img { height: 65px; margin-top: .4rem; object-fit: contain; width: 65px; }
 .admin-toggle-field { align-items: center; color: #cbd5e1; display: flex; font: .7rem monospace; gap: .5rem; }
 .admin-modal footer { border-top: 1px solid rgba(100, 116, 139, .2); gap: .6rem; justify-content: flex-end; padding-top: 1rem; }
+.admin-bulk-approval-error { color: #fca5a5 !important; flex-basis: 100%; }
+.admin-approval-modal { max-width: 700px; }
+.admin-approval-list { display: grid; gap: .35rem; max-height: 50vh; overflow-y: auto; padding: .2rem 0 1rem; }
+.admin-approval-list > div { border-bottom: 1px solid rgba(100, 116, 139, .18); display: grid; gap: .2rem; padding: .55rem 0; }
+.admin-approval-toolbar { align-items: center; border-bottom: 1px solid rgba(100, 116, 139, .2); color: #cbd5e1; display: flex; font: .65rem monospace; justify-content: space-between; padding: .8rem 0; }
+.admin-approval-toolbar label, .admin-approval-select-row { align-items: center; display: flex; gap: .7rem; }
+.admin-approval-toolbar input[type="checkbox"], .admin-approval-select-row input[type="checkbox"] { accent-color: #f97316; flex: 0 0 auto; height: 17px; min-height: 0; width: 17px; }
+.admin-approval-select-row { border-bottom: 1px solid rgba(100, 116, 139, .18); cursor: pointer; padding: .55rem 0; }
+.admin-approval-select-row > span { display: grid; gap: .2rem; min-width: 0; }
+.admin-approval-list strong { color: #f8fafc; font: .74rem sans-serif; }
+.admin-approval-list small, .admin-approval-skipped { color: #94a3b8; font: .61rem/1.5 monospace; overflow-wrap: anywhere; }
+.admin-approval-skipped { margin: .6rem 0 1rem; }
+.admin-approval-skipped summary { cursor: pointer; }
+.admin-approval-skipped ul { max-height: 180px; overflow-y: auto; padding-left: 1.3rem; }
+.admin-approval-skipped li { margin: .35rem 0; }
 .admin-loading, .admin-denied { align-items: center; background: #020514; color: #94a3b8; display: flex; flex-direction: column; gap: .8rem; justify-content: center; min-height: calc(100vh - 72px); }
 .admin-loading svg { animation: authSpin .8s linear infinite; color: #fb923c; }
 .admin-denied h1 { color: #f8fafc; font: 800 2rem Georgia, serif; margin: 0; }
