@@ -27,6 +27,7 @@ import { assistantRateLimitDecision, createAssistantLimiters, resolveClientIp } 
 import { resolveLegacySellerOwnership } from "./sellerOwnership.js";
 import { normalizeReturnWindowDays, isReturnWindowOpen } from "../src/services/returnPolicy.js";
 import { isDeliveredPurchaseFor, publicReview, validateReviewInput } from "./reviews.js";
+import { isEligibleVendorEnquiryProduct, isValidSupplierDocumentId } from "./vendorEnquiries.js";
 import { redactAuditValue } from "./audit.js";
 import { firebaseIdTokenDiagnostics, verifyFirebaseIdToken } from "./authentication.js";
 import { hasAdminClaim } from "./adminAuthorization.js";
@@ -55,6 +56,7 @@ console.info("[Cloudinary] startup configuration:", cloudinaryCredentialPresence
 const reviewLimiter = createRateLimiter({ limit: 5, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
 const reviewReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const publicProductContactLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
+const publicProductSellerNameLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const bulkImportUpload = multer({
   storage: multer.memoryStorage(),
   limits: { files: 1, fileSize: BULK_IMPORT_LIMITS.maxFileSize },
@@ -723,6 +725,52 @@ app.get("/api/products/:productId/vendor-contact", async (request, response) => 
   } catch (error) {
     console.error("Public product seller contact could not be loaded:", error?.message || error);
     return response.status(500).json({ message: "Seller contact information is unavailable." });
+  }
+});
+
+app.post("/api/products/vendor-names", async (request, response) => {
+  const productIds = request.body?.productIds;
+  if (!Array.isArray(productIds) || productIds.length < 1 || productIds.length > 100
+    || productIds.some((productId) => !isValidSupplierDocumentId(productId))) {
+    return response.status(400).json({ message: "Provide between 1 and 100 valid product IDs." });
+  }
+  const limit = publicProductSellerNameLimiter.check(`ip:${resolveClientIp(request)}`);
+  if (!limit.allowed) return response.status(429).json({ message: "Too many seller-name requests. Try again shortly." });
+
+  try {
+    const db = getDb();
+    const productSnapshots = [];
+    for (let index = 0; index < productIds.length; index += 100) {
+      const references = productIds.slice(index, index + 100).map((productId) => db.collection("products").doc(productId));
+      productSnapshots.push(...await db.getAll(...references));
+    }
+    const vendorProductCandidates = productSnapshots.filter((snapshot) => {
+      if (!snapshot.exists) return false;
+      const product = snapshot.data();
+      return String(product.sellerType || "").trim().toLowerCase() === "vendor"
+        && typeof product.sellerId === "string"
+        && Boolean(product.sellerId.trim());
+    });
+    const vendorIds = [...new Set(vendorProductCandidates.map((snapshot) => snapshot.data().sellerId.trim()))];
+    const vendorSnapshots = [];
+    for (let index = 0; index < vendorIds.length; index += 300) {
+      const references = vendorIds.slice(index, index + 300).map((vendorId) => db.collection("users").doc(vendorId));
+      vendorSnapshots.push(...await db.getAll(...references));
+    }
+    const vendorById = new Map(vendorSnapshots.map((snapshot) => [snapshot.id, snapshot.exists ? snapshot.data() : null]));
+    const eligibleVendorProducts = vendorProductCandidates.filter((snapshot) =>
+      isEligibleVendorEnquiryProduct(snapshot.data(), vendorById.get(snapshot.data().sellerId.trim()))
+    );
+    const names = {};
+    for (const productSnapshot of eligibleVendorProducts) {
+      const vendor = vendorById.get(productSnapshot.data().sellerId.trim());
+      const businessName = String(vendor?.vendorProfile?.businessName || "").trim();
+      if (businessName) names[productSnapshot.id] = businessName;
+    }
+    return response.json({ names, eligibleProductIds: eligibleVendorProducts.map((snapshot) => snapshot.id) });
+  } catch (error) {
+    console.error("Public product seller names could not be loaded:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Seller business names could not be loaded." });
   }
 });
 
