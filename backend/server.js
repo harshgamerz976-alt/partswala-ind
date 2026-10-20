@@ -4293,6 +4293,8 @@ app.post("/api/ai/chat", async (request, response) => {
 
 export default app;
 
+console.log("[Runtime] Node.js version:", process.version);
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   app.listen(port, "0.0.0.0", () => console.log(`Partswala backend listening on http://localhost:${port}`));
 }
