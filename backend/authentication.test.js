@@ -11,6 +11,9 @@ test("financial, administrative, account, and personal-data routes check revocat
     "/api/phonepe/orders",
     "/api/shiprocket/orders",
     "/api/vendor/finance",
+    "/api/enquiries",
+    "/api/vendor/enquiries",
+    "/api/vendor/enquiries/enquiry-1/quote",
     "/api/phone/verification",
     "/api/ai/chat",
   ]) assert.equal(shouldCheckTokenRevocation(path), true, path);

@@ -5,7 +5,7 @@ import cors from "cors";
 import express from "express";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore } from "firebase-admin/firestore";
+import { FieldPath, getFirestore } from "firebase-admin/firestore";
 import { calculateOrderPricing } from "./pricing.js";
 import { customerFacingPricing } from "./customerPricing.js";
 import { getShiprocketShippingQuote } from "./shipping.js";
@@ -27,7 +27,15 @@ import { assistantRateLimitDecision, createAssistantLimiters, resolveClientIp } 
 import { resolveLegacySellerOwnership } from "./sellerOwnership.js";
 import { normalizeReturnWindowDays, isReturnWindowOpen } from "../src/services/returnPolicy.js";
 import { isDeliveredPurchaseFor, publicReview, validateReviewInput } from "./reviews.js";
-import { isEligibleVendorEnquiryProduct, isValidSupplierDocumentId } from "./vendorEnquiries.js";
+import {
+  canCreateSupplierEnquiry,
+  canQuoteSupplierEnquiry,
+  isEligibleVendorEnquiryProduct,
+  isValidSupplierDocumentId,
+  serializeSupplierEnquiry,
+  validateSupplierEnquiryInput,
+  validateSupplierQuoteInput,
+} from "./vendorEnquiries.js";
 import { redactAuditValue } from "./audit.js";
 import { firebaseIdTokenDiagnostics, verifyFirebaseIdToken } from "./authentication.js";
 import { hasAdminClaim } from "./adminAuthorization.js";
@@ -57,6 +65,8 @@ const reviewLimiter = createRateLimiter({ limit: 5, windowMs: 60 * 60 * 1000, ma
 const reviewReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const publicProductContactLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const publicProductSellerNameLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
+const supplierEnquiryLimiter = createRateLimiter({ limit: 10, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
+const supplierEnquiryReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 20000 });
 const bulkImportUpload = multer({
   storage: multer.memoryStorage(),
   limits: { files: 1, fileSize: BULK_IMPORT_LIMITS.maxFileSize },
@@ -771,6 +781,186 @@ app.post("/api/products/vendor-names", async (request, response) => {
   } catch (error) {
     console.error("Public product seller names could not be loaded:", error?.code || "firestore_error");
     return response.status(500).json({ message: "Seller business names could not be loaded." });
+  }
+});
+
+app.post("/api/vendor/enquiries", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const rate = supplierEnquiryLimiter.check(`user:${user.uid}`);
+  if (!rate.allowed) return response.status(429).json({ message: "Too many enquiries. Try again later." });
+  let input;
+  try {
+    input = validateSupplierEnquiryInput(request.body);
+  } catch (error) {
+    return response.status(400).json({ message: error.message });
+  }
+  try {
+    const db = getDb();
+    const accountEmail = typeof user.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(user.email.trim())
+      ? user.email.trim()
+      : "";
+    if (input.shareEmail && !accountEmail) {
+      return response.status(400).json({ message: "Your account does not have a valid email address to share." });
+    }
+    const now = new Date().toISOString();
+    const enquiryRef = db.collection("vendorEnquiries").doc();
+    await db.runTransaction(async (transaction) => {
+      const buyerRef = db.collection("users").doc(user.uid);
+      const productRef = db.collection("products").doc(input.productId);
+      const [buyerSnapshot, productSnapshot] = await Promise.all([
+        transaction.get(buyerRef),
+        transaction.get(productRef),
+      ]);
+      const buyer = buyerSnapshot.exists ? buyerSnapshot.data() : null;
+      if (!canCreateSupplierEnquiry(buyer, isAdminUser(user))) throw new Error("BUYER_NOT_ALLOWED");
+      if (!productSnapshot.exists) throw new Error("PRODUCT_NOT_FOUND");
+      const product = productSnapshot.data();
+      const vendorId = typeof product.sellerId === "string" ? product.sellerId.trim() : "";
+      const vendorSnapshot = vendorId
+        ? await transaction.get(db.collection("users").doc(vendorId))
+        : null;
+      const vendor = vendorSnapshot?.exists ? vendorSnapshot.data() : null;
+      if (!isEligibleVendorEnquiryProduct(product, vendor)) throw new Error("PRODUCT_NOT_ELIGIBLE");
+      const businessName = String(vendor.vendorProfile?.businessName || "").trim();
+      transaction.create(enquiryRef, {
+        buyerId: user.uid,
+        buyerEmail: input.shareEmail ? accountEmail : null,
+        vendorId,
+        vendorBusinessName: businessName,
+        productId: input.productId,
+        productName: String(product.name || product.title || "").trim(),
+        partNumber: typeof product.partNumber === "string" ? product.partNumber.trim() : "",
+        quantity: input.quantity,
+        buyerMessage: input.message,
+        status: "new",
+        quoteAmount: null,
+        quoteMessage: "",
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+    return response.status(201).json({ enquiryId: enquiryRef.id, status: "new" });
+  } catch (error) {
+    if (error.message === "BUYER_NOT_ALLOWED") return response.status(403).json({ message: "Customer or approved vendor access is required to send an enquiry." });
+    if (error.message === "PRODUCT_NOT_FOUND") return response.status(404).json({ message: "This product listing is unavailable." });
+    if (error.message === "PRODUCT_NOT_ELIGIBLE") return response.status(409).json({ message: "This vendor product is not currently available for enquiries." });
+    console.error("Supplier enquiry could not be created:", error?.code || error?.message || "request_error");
+    return response.status(500).json({ message: "Your enquiry could not be sent. Please try again." });
+  }
+});
+
+async function listSupplierEnquiries(request, response, ownerField, ownerId) {
+  const rate = supplierEnquiryReadLimiter.check(`user:${ownerId}`);
+  if (!rate.allowed) return response.status(429).json({ message: "Too many enquiry requests. Try again shortly." });
+  const cursor = typeof request.query.cursor === "string" ? request.query.cursor.trim() : "";
+  if (cursor && !isValidSupplierDocumentId(cursor)) return response.status(400).json({ message: "Invalid enquiry cursor." });
+  try {
+    const db = getDb();
+    const collectionRef = db.collection("vendorEnquiries");
+    let query = collectionRef.where(ownerField, "==", ownerId).orderBy(FieldPath.documentId()).limit(51);
+    if (cursor) {
+      const cursorSnapshot = await collectionRef.doc(cursor).get();
+      if (!cursorSnapshot.exists || cursorSnapshot.data()?.[ownerField] !== ownerId) {
+        return response.status(400).json({ message: "Invalid enquiry cursor." });
+      }
+      query = query.startAfter(cursorSnapshot);
+    }
+    const snapshot = await query.get();
+    const hasMore = snapshot.size > 50;
+    const documents = snapshot.docs.slice(0, 50);
+    const view = ownerField === "vendorId" ? "vendor" : "buyer";
+    const enquiries = documents.map((document) => serializeSupplierEnquiry(document.id, document.data(), view));
+    return response.json({
+      enquiries,
+      cursor: hasMore ? documents.at(-1)?.id || null : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error("Supplier enquiries could not be loaded:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiries could not be loaded." });
+  }
+}
+
+app.get("/api/enquiries", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const buyerSnapshot = await getDb().collection("users").doc(user.uid).get();
+    const buyer = buyerSnapshot.exists ? buyerSnapshot.data() : null;
+    if (!canCreateSupplierEnquiry(buyer, isAdminUser(user))) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    return listSupplierEnquiries(request, response, "buyerId", user.uid);
+  } catch (error) {
+    console.error("Buyer enquiry access could not be verified:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiries could not be loaded." });
+  }
+});
+
+app.get("/api/vendor/enquiries", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const vendorSnapshot = await getDb().collection("users").doc(user.uid).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : null;
+    if (!vendor || vendor.role !== "vendor" || vendor.vendorStatus !== "approved" || isAdminUser(user)) {
+      return response.status(403).json({ message: "Approved vendor access is required." });
+    }
+    return listSupplierEnquiries(request, response, "vendorId", user.uid);
+  } catch (error) {
+    console.error("Vendor enquiry access could not be verified:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiries could not be loaded." });
+  }
+});
+
+app.patch("/api/vendor/enquiries/:enquiryId/quote", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const rate = supplierEnquiryLimiter.check(`quote:${user.uid}`);
+  if (!rate.allowed) return response.status(429).json({ message: "Too many quote updates. Try again later." });
+  const enquiryId = String(request.params.enquiryId || "").trim();
+  if (!isValidSupplierDocumentId(enquiryId)) return response.status(400).json({ message: "A valid enquiry ID is required." });
+  let quote;
+  try {
+    quote = validateSupplierQuoteInput(request.body);
+  } catch (error) {
+    return response.status(400).json({ message: error.message });
+  }
+  try {
+    const db = getDb();
+    const enquiryRef = db.collection("vendorEnquiries").doc(enquiryId);
+    const updatedAt = new Date().toISOString();
+    await db.runTransaction(async (transaction) => {
+      const vendorRef = db.collection("users").doc(user.uid);
+      const [vendorSnapshot, enquirySnapshot] = await Promise.all([
+        transaction.get(vendorRef),
+        transaction.get(enquiryRef),
+      ]);
+      const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : null;
+      if (!vendor || vendor.role !== "vendor" || vendor.vendorStatus !== "approved" || isAdminUser(user)) {
+        throw new Error("VENDOR_NOT_APPROVED");
+      }
+      if (!enquirySnapshot.exists) throw new Error("ENQUIRY_NOT_FOUND");
+      if (!canQuoteSupplierEnquiry(enquirySnapshot.data(), user.uid, vendor)) {
+        throw new Error("ENQUIRY_NOT_OWNED");
+      }
+      transaction.update(enquiryRef, {
+        status: "quoted",
+        quoteAmount: quote.amount,
+        quoteMessage: quote.message,
+        quoteCurrency: "INR",
+        quotedAt: updatedAt,
+        updatedAt,
+      });
+    });
+    return response.json({ enquiryId, status: "quoted", quoteAmount: quote.amount });
+  } catch (error) {
+    if (error.message === "VENDOR_NOT_APPROVED") return response.status(403).json({ message: "Approved vendor access is required." });
+    if (error.message === "ENQUIRY_NOT_FOUND") return response.status(404).json({ message: "Enquiry not found." });
+    if (error.message === "ENQUIRY_NOT_OWNED") return response.status(403).json({ message: "This enquiry cannot be quoted by your account." });
+    console.error("Supplier quote could not be saved:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Your quote could not be saved. Please try again." });
   }
 });
 
