@@ -44,6 +44,7 @@ import { normalizeFinanceDateRange } from "./financeDateRange.js";
 import { normalizeIndianState, resolveSellerTaxState, validatedDeliveryState } from "./sellerTaxContext.js";
 import { hasValidVendorPickupLocation, normalizeVendorPickupLocation } from "./vendorPickup.js";
 import { registerPublicSettingsRoute } from "./publicSettings.js";
+import { registerPublicProductCatalogRoutes } from "./publicProductCatalogRoutes.js";
 import multer from "multer";
 import {
   BULK_IMPORT_LIMITS,
@@ -709,6 +710,7 @@ function normalizeCustomer(payload, user) {
 }
 app.get("/health", (_request, response) => response.json({ ok: true, service: "partswala-ind-backend" }));
 registerPublicSettingsRoute(app, getDb);
+registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp });
 
 app.get("/api/products/:productId/vendor-contact", async (request, response) => {
   const productId = String(request.params.productId || "").trim();
