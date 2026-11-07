@@ -6,6 +6,9 @@ import "./index.css";
 import App from "./App.jsx";
 import { CartProvider } from "./context/CartContext.jsx";
 import { AuthProvider } from "./context/AuthContext";
+import { registerChunkLoadRecovery } from "./services/chunkLoadRecovery.js";
+
+registerChunkLoadRecovery();
 
 createRoot(document.getElementById("root")).render(
   <StrictMode>
@@ -23,6 +26,8 @@ createRoot(document.getElementById("root")).render(
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {});
+    navigator.serviceWorker.register("/sw.js").catch((error) => {
+      console.warn("The app service worker could not be registered.", error?.message || error);
+    });
   });
 }

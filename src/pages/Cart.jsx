@@ -34,8 +34,8 @@ export default function Cart() {
 
       <div className="cart-shipping-panel">
         <div className="cart-shipping-copy">
-          <strong>Final pricing is calculated at checkout</strong>
-          <span>Current product prices, eligible discounts, GST, delivery and payment fees</span>
+          <strong>Checkout is unavailable</strong>
+          <span>Orders, payments, and delivery are currently disabled. Contact a supplier to request a quote.</span>
         </div>
       </div>
 

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AI_PRODUCT_CACHE_MAX, compatibilityStatus, executeAssistantTool, searchCatalogProducts } from "./tools.js";
+import { compatibilityStatus, executeAssistantTool, searchCatalogProducts } from "./tools.js";
 import { calculateLineFinance } from "../finance.js";
 
 const products = [
@@ -53,29 +53,16 @@ test("store policy replies come from the public assistant settings", async () =>
   assert.equal(result.reply, "Returns are reviewed within seven days.");
 });
 
-test("cart values are refreshed from Firestore rather than browser-supplied prices", async () => {
-  let productLimit = 0;
+test("cart and shipping assistant tools are unavailable while commerce is disabled", async () => {
+  let databaseRead = false;
   const db = {
-    collection: (name) => {
-      if (name === "products") {
-        const productCollection = { get: async () => ({ docs: [{ id: "cart-part", data: () => ({ name: "Clutch Plate", price: 125, stock: 3, weight: 0.8, sellerType: "partswala" }) }] }) };
-        productCollection.limit = (count) => { productLimit = count; return productCollection; };
-        return productCollection;
-      }
-      throw new Error(`Unexpected collection ${name}`);
-    },
-    doc: (path) => ({ get: async () => ({ exists: true, data: () => path === "settings/store" ? { pickupPincode: "400001" } : {} }) }),
+    collection: () => { databaseRead = true; throw new Error("Database access is unavailable"); },
+    doc: () => { databaseRead = true; throw new Error("Database access is unavailable"); },
   };
   const actor = { role: "customer", user: null };
-  const cart = await executeAssistantTool({ db, actor, tool: "getCart", context: { cart: [{ id: "cart-part", quantity: 2, price: 1 }] } });
-  assert.equal(cart.items[0].price, 125);
-  assert.equal(cart.subtotal, 250);
-  assert.equal(productLimit, AI_PRODUCT_CACHE_MAX);
-  const shipping = await executeAssistantTool({ db, actor, tool: "getShippingEstimate", args: { productIds: ["cart-part"], deliveryPincode: "400002" } });
-  assert.equal(shipping.available, false);
-  assert.equal(shipping.amount, null);
-  assert.equal(shipping.actualWeight, 0.8);
-  assert.equal(shipping.message, "Final courier pricing is calculated at checkout.");
+  await assert.rejects(executeAssistantTool({ db, actor, tool: "getCart", context: { cart: [{ id: "cart-part", quantity: 2, price: 1 }] } }), /not available/);
+  await assert.rejects(executeAssistantTool({ db, actor, tool: "getShippingEstimate", args: { productIds: ["cart-part"], deliveryPincode: "400002" } }), /not available/);
+  assert.equal(databaseRead, false);
 });
 
 test("vendor order lookup reads only that vendor's settlement records", async () => {

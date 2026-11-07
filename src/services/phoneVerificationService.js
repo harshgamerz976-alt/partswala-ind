@@ -1,5 +1,6 @@
 import { auth } from "../firebase";
 import { formatIndianPhoneForFirebase } from "../../shared/phoneNumber.js";
+import { BACKEND_API_URL } from "./backendApiUrl.js";
 
 /**
  * Phone verification is owned by the backend. The browser only asks the backend to confirm the
@@ -8,8 +9,6 @@ import { formatIndianPhoneForFirebase } from "../../shared/phoneNumber.js";
  */
 
 export const PHONE_VERIFICATION_FIELDS = ["phoneVerified", "verifiedPhone", "phoneVerifiedAt", "phoneVerificationMethod"];
-
-const BASE_URL = (import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_API_URL || "http://localhost:8787").replace(/\/$/, "");
 
 /** Removes server-owned fields so a local profile save can never spoof phone verification. */
 export function stripProtectedProfileFields(data = {}) {
@@ -26,8 +25,9 @@ export async function registerVerifiedPhone(phone) {
   const token = await user.getIdToken(true);
   const tokenPhone = formatIndianPhoneForFirebase((await user.getIdTokenResult()).claims.phone_number);
   if (tokenPhone !== expectedPhone) throw new Error("Firebase has not refreshed the verified phone number yet. Please try again.");
-  const response = await fetch(`${BASE_URL}/api/phone/verification`, {
+  const response = await fetch(`${BACKEND_API_URL}/api/phone/verification`, {
     method: "POST",
+    cache: "no-store",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ phone: expectedPhone }),
   });

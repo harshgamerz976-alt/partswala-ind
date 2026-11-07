@@ -1,15 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  Bot, Check, ChevronDown, CircleHelp, ClipboardList, ExternalLink,
-  GitCompareArrows, PackageSearch, RotateCcw, Send, ShoppingCart, Sparkles,
-  Trash2, Truck, X,
+  Bot, ChevronDown, CircleHelp, ClipboardList, ExternalLink,
+  GitCompareArrows, PackageSearch, RotateCcw, Send, Sparkles, Truck,
+  Trash2, X,
 } from "lucide-react";
 import { useAuth } from "../../context/useAuth";
-import { useCart } from "../../context/useCart";
-import { db } from "../../firebase";
 import { sendAssistantMessage } from "../services/assistantApi";
-import { doc, onSnapshot } from "firebase/firestore";
+import { BACKEND_API_URL } from "../../services/backendApiUrl";
+import { fetchPublicAssistantSettings } from "../../../shared/publicSiteSettings.js";
 import "../assistant.css";
 
 const WELCOME = "How can I help you find the right part? Tell me your truck model, part, or order question.";
@@ -31,8 +30,7 @@ function stockLabel(stock) {
   return count > 0 ? `${count} in stock` : "Out of stock";
 }
 
-function ProductCard({ product, addProduct }) {
-  const available = Number(product.stock) > 0;
+function ProductCard({ product }) {
   const fitment = product.compatibility || "Fitment not listed";
   const compatibilityLabel = product.compatibilityStatus === "verified"
     ? "Fitment verified from listing"
@@ -54,8 +52,7 @@ function ProductCard({ product, addProduct }) {
         <p className="pw-assistant-fitment">{compatibilityLabel}</p>
         <div className="pw-assistant-product-meta"><span>{stockLabel(product.stock)}</span><span>{product.weight ? `${product.weight} kg` : "Weight not listed"}</span><span>{product.warranty || "Warranty not listed"}</span><span>{product.sellerType === "vendor" ? "Vendor seller" : "PARTSWALA seller"} · {product.seller || "Seller not listed"}</span></div>
         <div className="pw-assistant-product-actions">
-          <Link to={`/products/${product.id}`} aria-label={`View ${product.name}`} title="View product"><ExternalLink size={15} /> View</Link>
-          <button type="button" onClick={() => addProduct(product)} disabled={!available} title={available ? "Add to cart" : "Out of stock"}><ShoppingCart size={15} /> Add to cart</button>
+          <Link to={`/products/${product.id}`} aria-label={`View ${product.name}`} title="View product"><ExternalLink size={15} /> View part and contact supplier</Link>
         </div>
       </div>
     </article>
@@ -77,7 +74,7 @@ function OrderCard({ order }) {
   );
 }
 
-function CompareTable({ products, addProduct }) {
+function CompareTable({ products }) {
   function specifications(product) {
     const specs = product.specifications || product.specs;
     if (typeof specs === "string") return specs.slice(0, 150) || "Not listed";
@@ -98,7 +95,7 @@ function CompareTable({ products, addProduct }) {
   ];
   return (
     <div className="pw-assistant-compare-wrap">
-      <table className="pw-assistant-compare"><thead><tr><th>Detail</th>{products.map((product) => <th key={product.id}><span>{product.name}</span><button type="button" onClick={() => addProduct(product)} disabled={!(Number(product.stock) > 0)}><ShoppingCart size={12} /> Add</button></th>)}</tr></thead>
+      <table className="pw-assistant-compare"><thead><tr><th>Detail</th>{products.map((product) => <th key={product.id}><span>{product.name}</span></th>)}</tr></thead>
         <tbody>{rows.map(([label, render]) => <tr key={label}><th>{label}</th>{products.map((product) => <td key={product.id}>{render(product)}</td>)}</tr>)}</tbody>
       </table>
       {products.map((product) => <Link className="pw-assistant-compare-link" key={product.id} to={`/products/${product.id}`}>View {product.name} <ExternalLink size={12} /></Link>)}
@@ -129,32 +126,21 @@ function FinanceSummary({ data }) {
   return <dl className="pw-assistant-finance">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value == null ? "Not recorded" : money(value)}</dd></div>)}</dl>;
 }
 
-function ResultContent({ message, addProduct, confirmRemoval, cancelRemoval }) {
+function ResultContent({ message }) {
   const data = message.data || {};
   return (
     <>
-      {Array.isArray(data.products) && message.action === "compareProducts" && data.products.length > 1 && <CompareTable products={data.products} addProduct={addProduct} />}
-      {Array.isArray(data.products) && message.action !== "compareProducts" && data.products.map((product) => <ProductCard key={product.id} product={product} addProduct={addProduct} />)}
-      {data.product && <ProductCard product={data.product} addProduct={addProduct} />}
+      {Array.isArray(data.products) && message.action === "compareProducts" && data.products.length > 1 && <CompareTable products={data.products} />}
+      {Array.isArray(data.products) && message.action !== "compareProducts" && data.products.map((product) => <ProductCard key={product.id} product={product} />)}
+      {data.product && <ProductCard product={data.product} />}
       {Array.isArray(data.orders) && data.orders.map((order) => <OrderCard key={order.id} order={{ ...order, vendorView: data.isVendor }} />)}
       {data.needsLogin && <Link className="pw-assistant-inline-link" to="/login">Sign in to view orders <ExternalLink size={13} /></Link>}
-      {Array.isArray(data.items) && message.action === "getCart" && (
-        data.items.length > 0 && <section className="pw-assistant-cart">
-          {data.items.map((item) => <div key={item.id}><span>{item.name} × {item.quantity}</span><b>{money(item.price * item.quantity)}</b></div>)}
-          <footer><span>Subtotal before checkout tax and shipping</span><strong>{money(data.subtotal)}</strong></footer>
-          <Link to="/cart">Open cart <ExternalLink size={13} /></Link>
-        </section>
-      )}
-      {data.available && message.action === "getShippingEstimate" && <div className="pw-assistant-estimate"><Truck size={16} /><span>{data.actualWeight} kg actual weight · estimate only</span><strong>{money(data.amount)}</strong></div>}
       {message.action === "getVendorSales" && Array.isArray(data) && <div className="pw-assistant-vendor-list">{data.slice(0, 8).map((vendor) => <div key={vendor.vendorId}><span>Vendor {String(vendor.vendorId).slice(0, 8)} · {vendor.orders} orders</span><b>{money(vendor.sales)}</b></div>)}</div>}
       {message.action === "getVendorSales" && !Array.isArray(data) && data.totalSales != null && <div className="pw-assistant-metrics"><span>Sales today <b>{money(data.todaySales)}</b></span><span>Total sales <b>{money(data.totalSales)}</b></span><span>Commission recorded <b>{money(data.commission)}</b></span><span>Pending payout <b>{money(data.payout?.pending)}</b></span></div>}
       {message.action === "getVendorPayout" && data.balances && <div className="pw-assistant-metrics"><span>Pending <b>{money(data.balances.pending)}</b></span><span>Payable <b>{money(data.balances.payable)}</b></span><span>Paid <b>{money(data.balances.paid)}</b></span></div>}
       {message.action === "getVendorPayout" && Array.isArray(data.settlements) && data.settlements.map((row) => <article className="pw-assistant-settlement" key={row.id}><div><strong>Order #{String(row.orderId).slice(0, 10)} · {row.productName || "Vendor sale"}</strong><span>{row.settlementStatus} · {row.statusReason}</span></div><b>{money(row.vendorPayout)}</b></article>)}
       {message.action === "getVendorPayout" && !data.balances && data.pending != null && <div className="pw-assistant-metrics"><span>Pending / held <b>{money(data.pending)}</b></span><span>Payable <b>{money(data.payable)}</b></span><span>Paid <b>{money(data.paid)}</b></span></div>}
       {message.action === "getAdminFinance" && <FinanceSummary data={data} />}
-      {message.action === "removeFromCart" && data.clientAction && (
-        <div className="pw-assistant-confirm"><button type="button" onClick={() => confirmRemoval(data.clientAction.productId, data.name)}><Check size={14} /> Remove item</button><button type="button" onClick={cancelRemoval}>Keep item</button></div>
-      )}
       {message.action === "getLowStockProducts" && Array.isArray(data.products) && data.products.map((product) => <div className="pw-assistant-low-stock" key={product.id}><span>{product.name} · {product.partNumber}</span><b>{stockLabel(product.stock)}</b></div>)}
     </>
   );
@@ -162,20 +148,28 @@ function ResultContent({ message, addProduct, confirmRemoval, cancelRemoval }) {
 
 export default function AssistantWidget() {
   const { currentUser, role } = useAuth();
-  const { cart, addToCart, removeFromCart } = useCart();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [typing, setTyping] = useState(false);
   const [error, setError] = useState("");
   const [failedMessage, setFailedMessage] = useState("");
-  const [enabled, setEnabled] = useState(true);
+  const [enabled, setEnabled] = useState(false);
   const [messages, setMessages] = useState([{ id: "welcome", role: "assistant", text: WELCOME }]);
   const messagesRef = useRef(null);
   const inputRef = useRef(null);
 
-  useEffect(() => onSnapshot(doc(db, "settings", "assistant"), (snapshot) => {
-    setEnabled(!snapshot.exists() || snapshot.data().enabled !== false);
-  }, () => setEnabled(true)), []);
+  useEffect(() => {
+    let cancelled = false;
+    fetchPublicAssistantSettings(BACKEND_API_URL)
+      .then(({ enabled: assistantEnabled }) => {
+        if (!cancelled) setEnabled(assistantEnabled);
+      })
+      .catch((settingsError) => {
+        console.error("Could not verify public assistant settings.", settingsError);
+        if (!cancelled) setEnabled(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (open) {
@@ -193,12 +187,6 @@ export default function AssistantWidget() {
 
   function appendAssistant(text, data = {}, action = "") {
     setMessages((previous) => [...previous, { id: `${Date.now()}-${Math.random()}`, role: "assistant", text, data, action }]);
-  }
-
-  function addProduct(product, quantity = 1) {
-    if (!(Number(product.stock) > 0)) return;
-    addToCart(product, quantity);
-    appendAssistant(`${product.name} has been added to your cart.`);
   }
 
   async function sendMessage(rawText) {
@@ -219,11 +207,9 @@ export default function AssistantWidget() {
         context: {
           recentProducts: recentProducts.map(({ id, name, partNumber }) => ({ id, name, partNumber })),
           recentProductIds: recentProducts.map((item) => item.id),
-          cart: cart.map(({ id, name, title, partNumber, quantity }) => ({ id, name, title, partNumber, quantity })),
         },
       });
       appendAssistant(result.text, result, result.action || "");
-      if (result.clientAction?.type === "addToCart") addToCart(result.clientAction.product, result.clientAction.quantity);
     } catch (requestError) {
       setFailedMessage(text);
       setError(requestError.message || "I'm having trouble reaching PARTSWALA AI. Please try again.");
@@ -241,11 +227,6 @@ export default function AssistantWidget() {
     setMessages([{ id: `welcome-${Date.now()}`, role: "assistant", text: WELCOME }]);
     setError("");
     setFailedMessage("");
-  }
-
-  function confirmRemoval(productId, name) {
-    removeFromCart(productId);
-    appendAssistant(`${name} has been removed from your cart.`);
   }
 
   if (!enabled) return null;
@@ -267,7 +248,7 @@ export default function AssistantWidget() {
                 {message.role === "assistant" && <span className="pw-assistant-avatar"><Sparkles size={14} /></span>}
                 <div className="pw-assistant-message-body">
                   <p className="pw-assistant-bubble">{message.text}</p>
-                  {message.role === "assistant" && <ResultContent message={message} addProduct={addProduct} confirmRemoval={confirmRemoval} cancelRemoval={() => appendAssistant("Okay, I'll leave your cart unchanged.")} />}
+                  {message.role === "assistant" && <ResultContent message={message} />}
                   {messages.length === 1 && index === 0 && message.role === "assistant" && (
                     <div className="pw-assistant-suggestions">{SUGGESTIONS.map(([label, Icon]) => <button type="button" key={label} onClick={() => sendMessage(label)}><Icon size={14} />{label}</button>)}</div>
                   )}

@@ -60,7 +60,30 @@ test("Firestore admin access allows the three admin emails and Firebase custom c
   assert.ok(adminPolicy.includes("request.auth.token.get('email', '') in ["));
 });
 
-test("review documents are public to read but backend-only to mutate", () => {
+test("raw product reads are always denied publicly and limited to admins or the approved owning vendor", () => {
+  const products = compact(matchBlock("products"));
+  assert.ok(products.includes("allow read: if isAdmin() || (isVendor() && resource.data.get('sellerId', '') == request.auth.uid);"));
+  assert.ok(!products.includes("request.time"), "raw product access must never unlock based on launch time");
+  assert.ok(products.includes("allow write: if false;"));
+});
+
+test("public product reads are served through the launch-gated sanitized backend API", () => {
+  const products = compact(matchBlock("products"));
+  assert.ok(!/allow read: if true|request\.time/.test(products));
+  const catalogRoutes = readFileSync(new URL("./publicProductCatalogRoutes.js", import.meta.url), "utf8");
+  assert.ok(catalogRoutes.includes("rejectMarketplaceBeforeLaunch"));
+  assert.ok(catalogRoutes.includes("sanitizePublicProduct"));
+  assert.ok(catalogRoutes.includes("setPublicProductCatalogNoStore"));
+});
+
+test("approved vendor direct product reads require matching ownership and admin access is retained", () => {
+  const isVendor = compact(rules.slice(rules.indexOf("function isVendor()"), rules.indexOf("\n    }", rules.indexOf("function isVendor()"))));
+  assert.ok(isVendor.includes("data.role == 'vendor'"));
+  assert.ok(isVendor.includes("data.vendorStatus == 'approved'"));
+  assert.ok(compact(matchBlock("products")).includes("isAdmin()"));
+});
+
+test("review documents remain backend-only so reads cannot bypass the launch-gated API", () => {
   const reviews = compact(matchBlock("reviews"));
   assert.ok(reviews.includes("allow read, create, update, delete: if false;"));
 });

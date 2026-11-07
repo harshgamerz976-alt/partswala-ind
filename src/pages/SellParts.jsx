@@ -5,11 +5,11 @@ import { collection, doc, getDoc, getDocs, query, setDoc, updateDoc, where } fro
 import { useAuth } from "../context/useAuth";
 import { db } from "../firebase";
 import { uploadImageToCloudinary } from "../services/cloudinaryService";
+import { validateVendorProductImageFile } from "../services/vendorProductImageValidation";
+import { getVendorProductSubmissionError, MAX_VENDOR_PRODUCT_IMAGES } from "../services/vendorProductSubmission";
 import { getVendorDashboard, getVendorPickupLocation, saveVendorPickupLocation } from "../services/orderService";
 import ShippingEstimateCard from "../components/ShippingEstimateCard";
 
-const MAX_IMAGES = 5;
-const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 const EMPTY_PRODUCT = { name: "", partNumber: "", brand: "", category: "Engine Parts", mrp: "", price: "", stock: "", compatibility: "", weight: "", length: "", width: "", height: "", description: "" };
 const EMPTY_PICKUP = { name: "", contactPerson: "", phone: "", addressLine1: "", addressLine2: "", city: "", state: "", pincode: "", country: "India" };
 const CATEGORIES = [
@@ -49,7 +49,9 @@ export default function SellParts() {
   const [form, setForm] = useState(EMPTY_PRODUCT);
   const [submissions, setSubmissions] = useState([]);
   const [selectedImages, setSelectedImages] = useState([]);
+  const [selectedImagePreviews, setSelectedImagePreviews] = useState([]);
   const [existingImages, setExistingImages] = useState([]);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [editingSubmission, setEditingSubmission] = useState(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(true);
@@ -62,6 +64,12 @@ export default function SellParts() {
   const [pickupLoading, setPickupLoading] = useState(true);
   const [pickupSaving, setPickupSaving] = useState(false);
   const [pickupMessage, setPickupMessage] = useState("");
+
+  useEffect(() => {
+    const previews = selectedImages.map((file) => URL.createObjectURL(file));
+    setSelectedImagePreviews(previews);
+    return () => previews.forEach((preview) => URL.revokeObjectURL(preview));
+  }, [selectedImages]);
 
   const loadSubmissions = useCallback(async () => {
     setRefreshing(true);
@@ -116,7 +124,7 @@ export default function SellParts() {
     try {
       const result = await saveVendorPickupLocation(pickup);
       setPickup({ ...EMPTY_PICKUP, ...result.pickupLocation });
-      setPickupMessage("Pickup location saved. New shipping quotes will use this address.");
+      setPickupMessage("Pickup location saved. Shipping remains unavailable.");
     } catch (error) {
       setPickupMessage(error.message || "Pickup location could not be saved.");
     } finally {
@@ -127,12 +135,14 @@ export default function SellParts() {
   function chooseImages(event) {
     const files = [...(event.target.files || [])];
     event.target.value = "";
-    if (files.length + selectedImages.length + existingImages.length > MAX_IMAGES) {
-      setMessage(`A product submission can include at most ${MAX_IMAGES} images.`);
+    if (files.length + selectedImages.length + existingImages.length > MAX_VENDOR_PRODUCT_IMAGES) {
+      setMessage(`A product submission can include at most ${MAX_VENDOR_PRODUCT_IMAGES} images.`);
       return;
     }
-    if (files.some((file) => !file.type.startsWith("image/") || file.size > MAX_IMAGE_SIZE)) {
-      setMessage("Select image files no larger than 5 MB each.");
+    try {
+      files.forEach(validateVendorProductImageFile);
+    } catch (error) {
+      setMessage(error.message);
       return;
     }
     setMessage("");
@@ -145,6 +155,7 @@ export default function SellParts() {
     setForm({ ...EMPTY_PRODUCT, ...submission, length: submission.dimensions?.length || "", width: submission.dimensions?.width || "", height: submission.dimensions?.height || "" });
     setExistingImages(submission.images || (submission.imageUrl ? [submission.imageUrl] : []));
     setSelectedImages([]);
+    setUploadProgress(0);
     setMessage("");
     document.getElementById("vendor-product-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -155,19 +166,8 @@ export default function SellParts() {
     setForm(EMPTY_PRODUCT);
     setExistingImages([]);
     setSelectedImages([]);
+    setUploadProgress(0);
     setMessage("");
-  }
-
-  function hasCompletePickupLocation() {
-    return Boolean(
-      pickup?.name &&
-      pickup?.contactPerson &&
-      pickup?.phone &&
-      pickup?.addressLine1 &&
-      pickup?.city &&
-      pickup?.state &&
-      /^\d{6}$/.test(String(pickup?.pincode || ""))
-    );
   }
 
   function startProductEdit(product) {
@@ -176,43 +176,39 @@ export default function SellParts() {
     setForm({ ...EMPTY_PRODUCT, ...product, length: product.dimensions?.length || "", width: product.dimensions?.width || "", height: product.dimensions?.height || "" });
     setExistingImages(product.images || (product.imageUrl ? [product.imageUrl] : []));
     setSelectedImages([]);
+    setUploadProgress(0);
     setMessage("");
     document.getElementById("vendor-product-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   async function submitProduct(event) {
     event.preventDefault();
-    if (!hasCompletePickupLocation()) {
-      setMessage("Save a complete vendor pickup location and valid 6-digit pincode before submitting a product.");
-      return;
-    }
-    const numericFields = ["price", "mrp", "stock", "weight", "length", "width", "height"];
-    if (numericFields.some((field) => form[field] !== "" && (!Number.isFinite(Number(form[field])) || Number(form[field]) < 0))) {
-      setMessage("Enter valid non-negative numbers for price, stock, weight, and dimensions.");
-      return;
-    }
-    if (!form.partNumber.trim() || form.weight === "" || Number(form.weight) <= 0) {
-      setMessage("Part number and a positive shipping weight are required.");
-      return;
-    }
-    if (existingImages.length + selectedImages.length === 0) {
-      setMessage("Add at least one product image before submitting.");
-      return;
-    }
-    if (existingImages.length + selectedImages.length > MAX_IMAGES) {
-      setMessage(`A product submission can include at most ${MAX_IMAGES} images.`);
+    const validationError = getVendorProductSubmissionError(form, existingImages.length + selectedImages.length);
+    if (validationError) {
+      setMessage(validationError);
       return;
     }
     setLoading(true);
     setMessage("");
+    setUploadProgress(0);
     try {
       const timestamp = new Date().toISOString();
       const imageUrls = [...existingImages];
       const submissionId = editingSubmission?.id || crypto.randomUUID();
       const submissionRef = doc(db, "sellerSubmissions", submissionId);
-      const uploadedUrls = await Promise.all(selectedImages.map((file) => uploadImageToCloudinary(file, "submission")));
+      const uploadedUrls = [];
+      const productId = editingProduct?.id || editingSubmission?.existingProductId || "";
+      for (let index = 0; index < selectedImages.length; index += 1) {
+        const imageUrl = await uploadImageToCloudinary(selectedImages[index], "submission", {
+          productId,
+          onProgress(percent) {
+            setUploadProgress(Math.round(((index + percent / 100) / selectedImages.length) * 100));
+          },
+        });
+        uploadedUrls.push(imageUrl);
+      }
       imageUrls.push(...uploadedUrls);
-      if (imageUrls.length > MAX_IMAGES) throw new Error(`A product submission can include at most ${MAX_IMAGES} images.`);
+      if (imageUrls.length > MAX_VENDOR_PRODUCT_IMAGES) throw new Error(`A product submission can include at most ${MAX_VENDOR_PRODUCT_IMAGES} images.`);
       const productData = {
         name: form.name.trim(),
         description: form.description.trim(),
@@ -288,7 +284,7 @@ export default function SellParts() {
           ].map(([label, value, type]) => <article className="vendor-metric" key={label}><span>{label}</span><strong>{value === undefined ? "—" : type === "money" ? money(value) : Number(value).toLocaleString("en-IN")}</strong></article>)}
         </section>
         <div className="vendor-dashboard-grid">
-          <aside className="vendor-profile-panel vendor-sidebar"><div className="vendor-brand"><Store size={18} /><span>PARTSWALA</span></div><p className="vendor-kicker">VENDOR MENU</p><nav className="vendor-sidebar-menu" aria-label="Vendor dashboard sections"><a href="#vendor-dashboard-overview">Overview</a><a href="#vendor-products">Products</a>{isVendor && <Link to="/vendor/import">Bulk Upload Products</Link>}<a href="#vendor-orders">Orders</a><a href="#vendor-sales">Sales</a><a href="#vendor-payouts">Payouts</a><a href="#vendor-product-form">Add Product</a><a href="#vendor-reviews">Product Reviews</a><Link to="/profile">Account Settings</Link></nav><div id="vendor-account" className="vendor-account-details"><p className="vendor-kicker">APPROVED VENDOR</p><h2>{vendorName}</h2><dl><div><dt>Owner / contact</dt><dd>{vendorProfile.ownerName || userProfile?.displayName || "—"}</dd></div><div><dt>Email</dt><dd>{currentUser.email || "—"}</dd></div><div><dt>Phone</dt><dd>{vendorProfile.phone || "—"}</dd></div><div><dt>Location</dt><dd>{[vendorProfile.city, vendorProfile.state, vendorProfile.pincode].filter(Boolean).join(", ") || "—"}</dd></div><div><dt>Vendor commission</dt><dd>{dashboard?.vendor?.commissionRate == null ? "—" : `${dashboard.vendor.commissionRate}%`}</dd></div></dl></div></aside>
+          <aside className="vendor-profile-panel vendor-sidebar"><div className="vendor-brand"><Store size={18} /><span>PARTSWALA</span></div><p className="vendor-kicker">VENDOR MENU</p><nav className="vendor-sidebar-menu" aria-label="Vendor dashboard sections"><a href="#vendor-dashboard-overview">Overview</a><a href="#vendor-products">Products</a>{isVendor && <Link to="/vendor/import">Bulk Upload Products</Link>}{isVendor && <Link to="/vendor/enquiries">Supplier enquiries</Link>}<a href="#vendor-orders">Orders</a><a href="#vendor-sales">Sales</a><a href="#vendor-payouts">Payouts</a><a href="#vendor-product-form">Add Product</a><a href="#vendor-reviews">Product Reviews</a><Link to="/profile">Account Settings</Link></nav><div id="vendor-account" className="vendor-account-details"><p className="vendor-kicker">APPROVED VENDOR</p><h2>{vendorName}</h2><dl><div><dt>Owner / contact</dt><dd>{vendorProfile.ownerName || userProfile?.displayName || "—"}</dd></div><div><dt>Email</dt><dd>{currentUser.email || "—"}</dd></div><div><dt>Phone</dt><dd>{vendorProfile.phone || "—"}</dd></div><div><dt>Location</dt><dd>{[vendorProfile.city, vendorProfile.state, vendorProfile.pincode].filter(Boolean).join(", ") || "—"}</dd></div><div><dt>Vendor commission</dt><dd>{dashboard?.vendor?.commissionRate == null ? "—" : `${dashboard.vendor.commissionRate}%`}</dd></div></dl></div></aside>
           <section className="vendor-content">
             <section id="vendor-products" className="vendor-section-panel"><div className="vendor-panel-heading"><div><p className="vendor-kicker">CATALOG</p><h2>My Products</h2></div><div className="flex flex-wrap gap-2">{isVendor && <Link className="vendor-primary" to="/vendor/import"><Upload size={15} />Bulk Upload Products</Link>}<button className="vendor-primary" type="button" onClick={() => document.getElementById("vendor-product-form")?.scrollIntoView({ behavior: "smooth", block: "start" })}><PackagePlus size={15} />Add Product</button></div></div>
               {dashboardLoading && !dashboard ? <p className="vendor-muted">Loading products...</p> : products.length === 0 ? <p className="vendor-empty">No products yet.</p> : <div className="vendor-table-scroll"><table className="vendor-data-table"><thead><tr><th>Product</th><th>Brand</th><th>SKU / Part No.</th><th>Category</th><th>Price</th><th>Stock</th><th>Status</th><th>Actions</th></tr></thead><tbody>{products.map((product) => <tr key={product.id}><td><div className="vendor-product-cell">{product.imageUrl ? <img src={product.imageUrl} alt="" /> : <span className="vendor-product-placeholder"><Store size={16} /></span>}<strong>{product.name || "—"}</strong></div></td><td>{product.brand || "—"}</td><td>{product.partNumber || "—"}</td><td>{product.category || "—"}</td><td>{money(product.price)}</td><td>{product.stock ?? "—"}</td><td><em className={`vendor-status ${product.enabled ? "vendor-status-approved" : "vendor-status-rejected"}`}>{product.enabled ? "Active" : product.status || "Inactive"}</em></td><td><div className="vendor-row-actions"><Link to={`/products/${product.id}`} aria-label={`View ${product.name}`} title="View product"><Eye size={15} /></Link><button type="button" onClick={() => startProductEdit(product)} aria-label={`Request edit for ${product.name}`} title="Request product edit"><Pencil size={15} /></button></div></td></tr>)}</tbody></table></div>}
@@ -304,7 +300,7 @@ export default function SellParts() {
               {settlements.length === 0 ? <p className="vendor-empty">No payouts yet.</p> : settlements.map((entry) => <article className="vendor-settlement-row" key={entry.id}><div><strong>Order #{String(entry.orderId).slice(0, 10)} · {entry.productName || "Vendor sale"}</strong><span>Sale {money(entry.sellerSubtotal)} · Commission {entry.commissionRate}% ({money(entry.commissionAmount)}) · Other deductions {money(entry.otherDeductions)}</span></div><b>{money(entry.vendorPayout)}</b><em className={`vendor-status vendor-status-${entry.settlementStatus}`}>{entry.settlementStatus}</em></article>)}
             </section>
 
-            <section id="vendor-pickup-location" className="vendor-form-panel"><div className="vendor-panel-heading"><div><p className="vendor-kicker">SHIPMENT ORIGIN</p><h2>Pickup Location</h2></div><Store size={20} /></div><p className="vendor-muted">Orders for your products are collected from this address. A valid pickup location is required before selling.</p><form className="vendor-product-form" onSubmit={submitPickup}><div className="vendor-two-fields"><label>Pickup location name<input required name="name" value={pickup.name} onChange={updatePickup} /></label><label>Contact person<input required name="contactPerson" value={pickup.contactPerson} onChange={updatePickup} /></label></div><div className="vendor-two-fields"><label>Phone number<input required name="phone" inputMode="tel" value={pickup.phone} onChange={updatePickup} /></label><label>Country<input required name="country" value={pickup.country} onChange={updatePickup} /></label></div><label>Address line 1<input required name="addressLine1" value={pickup.addressLine1} onChange={updatePickup} /></label><label>Address line 2 <span>Optional</span><input name="addressLine2" value={pickup.addressLine2} onChange={updatePickup} /></label><div className="vendor-two-fields"><label>City<input required name="city" value={pickup.city} onChange={updatePickup} /></label><label>State<input required name="state" value={pickup.state} onChange={updatePickup} /></label></div><label>Pincode<input required pattern="[0-9]{6}" maxLength="6" inputMode="numeric" name="pincode" value={pickup.pincode} onChange={updatePickup} /></label>{pickupMessage && <p className="vendor-error" role="alert">{pickupMessage}</p>}<button className="vendor-primary" type="submit" disabled={pickupLoading || pickupSaving}>{pickupSaving ? "Saving..." : "Save pickup location"}</button></form></section>
+            <section id="vendor-pickup-location" className="vendor-form-panel"><div className="vendor-panel-heading"><div><p className="vendor-kicker">OPTIONAL VENDOR PROFILE</p><h2>Pickup Location</h2></div><Store size={20} /></div><p className="vendor-muted">These optional details are saved to your vendor profile. Shipping and product collection are not available in this quote-based marketplace.</p><form className="vendor-product-form" onSubmit={submitPickup}><div className="vendor-two-fields"><label>Pickup location name<input required name="name" value={pickup.name} onChange={updatePickup} /></label><label>Contact person<input required name="contactPerson" value={pickup.contactPerson} onChange={updatePickup} /></label></div><div className="vendor-two-fields"><label>Phone number<input required name="phone" inputMode="tel" value={pickup.phone} onChange={updatePickup} /></label><label>Country<input required name="country" value={pickup.country} onChange={updatePickup} /></label></div><label>Address line 1<input required name="addressLine1" value={pickup.addressLine1} onChange={updatePickup} /></label><label>Address line 2 <span>Optional</span><input name="addressLine2" value={pickup.addressLine2} onChange={updatePickup} /></label><div className="vendor-two-fields"><label>City<input required name="city" value={pickup.city} onChange={updatePickup} /></label><label>State<input required name="state" value={pickup.state} onChange={updatePickup} /></label></div><label>Pincode<input required pattern="[0-9]{6}" maxLength="6" inputMode="numeric" name="pincode" value={pickup.pincode} onChange={updatePickup} /></label>{pickupMessage && <p className="vendor-error" role="alert">{pickupMessage}</p>}<button className="vendor-primary" type="submit" disabled={pickupLoading || pickupSaving}>{pickupSaving ? "Saving..." : "Save optional profile details"}</button></form></section>
 
             <section id="vendor-product-form" className="vendor-form-panel"><div className="vendor-panel-heading"><div><p className="vendor-kicker">PRODUCT REVIEW</p><h2>{editingSubmission ? "Edit and resubmit" : editingProduct ? "Request product edit" : "Add Product"}</h2></div><PackagePlus size={20} /></div>
               <form className="vendor-product-form" onSubmit={submitProduct}>
@@ -318,10 +314,11 @@ export default function SellParts() {
                 <div className="vendor-dimensions"><span>Package dimensions <em>Optional</em></span><div><label>Length (cm)<input min="0" step="0.1" type="number" name="length" value={form.length || ""} onChange={updateField} /></label><label>Width (cm)<input min="0" step="0.1" type="number" name="width" value={form.width || ""} onChange={updateField} /></label><label>Height (cm)<input min="0" step="0.1" type="number" name="height" value={form.height || ""} onChange={updateField} /></label></div></div>
                 <ShippingEstimateCard weight={form.weight} length={form.length} width={form.width} height={form.height} />
                 <label>Description<textarea required name="description" rows="4" value={form.description} onChange={updateField} /></label>
-                <label className="vendor-image-picker">Product images ({existingImages.length + selectedImages.length}/{MAX_IMAGES})<input type="file" accept="image/*" multiple onChange={chooseImages} disabled={existingImages.length + selectedImages.length >= MAX_IMAGES} /><small>At least one image required; up to five images, 5 MB maximum each.</small></label>
-                {(existingImages.length > 0 || selectedImages.length > 0) && <div className="vendor-image-grid">{existingImages.map((image, index) => <figure key={image}><img src={image} alt={`Product image ${index + 1}`} /><button type="button" onClick={() => setExistingImages((previous) => previous.filter((_, imageIndex) => imageIndex !== index))} aria-label="Remove image">×</button></figure>)}{selectedImages.map((image, index) => <div className="vendor-selected-file" key={`${image.name}-${index}`}>{image.name}<button type="button" onClick={() => setSelectedImages((previous) => previous.filter((_, fileIndex) => fileIndex !== index))} aria-label="Remove selected image">×</button></div>)}</div>}
+                <label className="vendor-image-picker">Product images ({existingImages.length + selectedImages.length}/{MAX_IMAGES})<input type="file" accept="image/jpeg,image/png,image/webp,image/avif,image/heic" multiple onChange={chooseImages} disabled={loading || existingImages.length + selectedImages.length >= MAX_IMAGES} /><small>At least one image required; up to five images, 5 MB maximum each.</small></label>
+                {loading && selectedImages.length > 0 && <div className="vendor-upload-progress" role="status"><span>Uploading images: {uploadProgress}%</span><progress max="100" value={uploadProgress}>{uploadProgress}%</progress></div>}
+                {(existingImages.length > 0 || selectedImages.length > 0) && <div className="vendor-image-grid">{existingImages.map((image, index) => <figure key={image}><img src={image} alt={`Product image ${index + 1}`} /><button type="button" disabled={loading} onClick={() => setExistingImages((previous) => previous.filter((_, imageIndex) => imageIndex !== index))} aria-label="Remove image">×</button></figure>)}{selectedImages.map((image, index) => <figure className="vendor-selected-image" key={`${image.name}-${index}`}><img src={selectedImagePreviews[index] || ""} alt={`Selected image ${index + 1}`} /><figcaption>{image.name}</figcaption><button type="button" disabled={loading} onClick={() => setSelectedImages((previous) => previous.filter((_, fileIndex) => fileIndex !== index))} aria-label="Remove selected image">×</button></figure>)}</div>}
                 {message && <p className="vendor-error" role="alert">{message}</p>}
-                <div className="vendor-form-actions"><button className="vendor-primary" type="submit" disabled={loading}>{loading ? <Loader2 size={16} /> : editingSubmission ? <RotateCcw size={16} /> : editingProduct ? <Pencil size={16} /> : <Send size={16} />}{loading ? "Saving..." : editingSubmission ? "Edit & Resubmit" : editingProduct ? "Send edit for review" : "Submit for review"}</button>{(editingSubmission || editingProduct) && <button className="vendor-secondary" type="button" onClick={resetForm}>Cancel</button>}</div>
+                <div className="vendor-form-actions"><button className="vendor-primary" type="submit" disabled={loading}>{loading ? <Loader2 size={16} /> : editingSubmission ? <RotateCcw size={16} /> : editingProduct ? <Pencil size={16} /> : <Send size={16} />}{loading ? selectedImages.length ? `Uploading ${uploadProgress}%…` : "Saving..." : editingSubmission ? "Edit & Resubmit" : editingProduct ? "Send edit for review" : "Submit for review"}</button>{(editingSubmission || editingProduct) && <button className="vendor-secondary" type="button" onClick={resetForm} disabled={loading}>Cancel</button>}</div>
               </form>
             </section>
             <section id="vendor-reviews" className="vendor-submissions-panel"><div className="vendor-panel-heading"><div><p className="vendor-kicker">SUBMISSION HISTORY</p><h2>Product reviews</h2></div><button className="vendor-refresh" type="button" onClick={loadSubmissions} disabled={refreshing} aria-label="Refresh product reviews"><RotateCcw size={15} /></button></div>

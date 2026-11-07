@@ -19,6 +19,8 @@ import { AuthContext } from "./useAuth";
 import { registerVerifiedPhone, stripProtectedProfileFields } from "../services/phoneVerificationService";
 import { formatIndianPhoneForFirebase } from "../../shared/phoneNumber.js";
 import { hasAdminClaim } from "../../backend/adminAuthorization.js";
+import { unregisterBrowserNotifications } from "../services/notificationService";
+import { getVerifiedVendorAccess } from "../services/vendorAccessService";
 
 function normalizePhoneForFirebase(phoneNumber) {
   return formatIndianPhoneForFirebase(phoneNumber);
@@ -29,6 +31,8 @@ export const AuthProvider = ({ children }) => {
   const [currentUser, setCurrentUser] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [vendorAccessApproved, setVendorAccessApproved] = useState(false);
+  const [vendorAccessLoading, setVendorAccessLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [phoneConfirmation, setPhoneConfirmation] = useState(null);
   const profileListenerRef = useRef(null);
@@ -48,12 +52,56 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    let requestVersion = 0;
+    let intervalId;
+
+    if (!currentUser || isAdmin || userProfile?.role !== "vendor" || userProfile?.vendorStatus !== "approved") {
+      setVendorAccessApproved(false);
+      setVendorAccessLoading(false);
+      return undefined;
+    }
+
+    setVendorAccessLoading(true);
+    const refreshVendorAccess = async () => {
+      const version = ++requestVersion;
+      try {
+        const approved = await getVerifiedVendorAccess(currentUser);
+        if (active && version === requestVersion) setVendorAccessApproved(approved);
+      } catch (error) {
+        console.warn("Vendor approval could not be verified.", error?.message || error);
+        if (active && version === requestVersion) setVendorAccessApproved(false);
+      } finally {
+        if (active && version === requestVersion) setVendorAccessLoading(false);
+      }
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refreshVendorAccess();
+    };
+
+    void refreshVendorAccess();
+    intervalId = window.setInterval(() => { void refreshVendorAccess(); }, 30000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    window.addEventListener("focus", refreshVendorAccess);
+
+    return () => {
+      active = false;
+      requestVersion += 1;
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      window.removeEventListener("focus", refreshVendorAccess);
+    };
+  }, [currentUser, isAdmin, userProfile?.role, userProfile?.vendorStatus]);
+
+  useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       const version = ++profileSyncVersionRef.current;
       profileListenerRef.current?.();
       profileListenerRef.current = null;
       setLoading(true);
       setCurrentUser(user);
+      setVendorAccessApproved(false);
+      setVendorAccessLoading(Boolean(user));
       if (!user) {
         setUserProfile(null);
         setIsAdmin(false);
@@ -150,6 +198,11 @@ export const AuthProvider = ({ children }) => {
   }
 
   async function logout() {
+    try {
+      await unregisterBrowserNotifications();
+    } catch (error) {
+      console.warn("Push notification token cleanup could not finish before sign-out.", error?.message || error);
+    }
     await signOut(auth);
   }
 
@@ -249,7 +302,8 @@ export const AuthProvider = ({ children }) => {
     userProfile,
     isAdmin,
     role: isAdmin ? "admin" : userProfile?.role || "customer",
-    isVendor: !isAdmin && userProfile?.role === "vendor" && userProfile?.vendorStatus === "approved",
+    isVendor: !isAdmin && vendorAccessApproved,
+    vendorAccessLoading,
     loading,
     login,
     signup,

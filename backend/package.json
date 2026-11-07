@@ -2,6 +2,9 @@
   "name": "partswala-ind-backend",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
@@ -14,10 +17,19 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
-    "firebase-admin": "^13.5.0",
+    "firebase-admin": "14.5.0",
     "groq-sdk": "^1.6.0",
     "multer": "^2.0.0",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "overrides": {
+    "@google-cloud/firestore-api": {
+      "google-gax": {
+        "rimraf": "6.1.3",
+        "glob": "14.0.3",
+        "minimatch": "11.0.3"
+      }
+    }
   },
   "devDependencies": {
     "firebase-tools": "^15.32.1"

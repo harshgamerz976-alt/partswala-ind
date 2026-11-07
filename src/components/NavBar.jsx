@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 
-export default function Navbar({ cartCount = 0, user = null, onLogout }) {
+export default function Navbar({ user = null, onLogout }) {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const navigate = useNavigate();
@@ -78,18 +78,6 @@ export default function Navbar({ cartCount = 0, user = null, onLogout }) {
 
         {/* Action Controls */}
         <div className="flex items-center gap-x-4 shrink-0">
-          {/* Cart Link */}
-          <Link to="/cart" className="relative p-2 text-slate-300 hover:text-[#f97316] transition-colors rounded-full hover:bg-slate-800/50 shrink-0">
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
-            </svg>
-            {cartCount > 0 && (
-              <span className="absolute top-0 right-0 min-w-5 h-5 px-1 flex items-center justify-center text-xs font-black text-white bg-[#f97316] rounded-full ring-2 ring-[#0f172a]">
-                {cartCount}
-              </span>
-            )}
-          </Link>
-
           {/* Account Button / Profile Link */}
           {user ? (
             <Link to="/profile" className="flex items-center space-x-2 p-1 pr-3 rounded-full bg-slate-800/60 border border-slate-700/50 hover:border-[#f97316] transition-all shrink-0">

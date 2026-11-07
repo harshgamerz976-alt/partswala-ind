@@ -60,6 +60,3 @@ export function calculateCodFee(orderValue, settings = {}) {
 	const percentage = Number(settings.codPercentage ?? SHIPPING_CONFIG.codPercentage) || 0;
 	return Number((fixedFee + Math.max(0, Number(orderValue) || 0) * percentage / 100).toFixed(2));
 }
-
-export async function createShipment(_order, _shippingInfo) { console.log("Delhivery integration requires backend"); }
-export async function trackShipment(_waybill) { console.log("Delhivery tracking requires backend"); }

@@ -1,10 +1,19 @@
 import { db, auth } from "../firebase";
 import { collection, getDocs, getDoc, doc, query, where, orderBy, onSnapshot, limit, startAfter } from "firebase/firestore";
 import { fetchPublicSiteSettings } from "../../shared/publicSiteSettings.js";
+import {
+  COMMERCE_UNAVAILABLE_MESSAGE,
+  CUSTOMER_COMMERCE_ENABLED,
+} from "../../shared/commerceAvailability.js";
+import { BACKEND_API_URL } from "./backendApiUrl";
 
 const COL = "orders";
 
 export const ORDER_STATUSES = ["pending", "confirmed", "processing", "packed", "cancelled"];
+
+function requireCustomerCommerce() {
+  if (!CUSTOMER_COMMERCE_ENABLED) throw new Error(COMMERCE_UNAVAILABLE_MESSAGE);
+}
 
 export function normalizeOrderStatus(order) {
   const status = String(order?.status || order?.orderStatus || "pending").toLowerCase().replace(/\s+/g, "_");
@@ -12,6 +21,7 @@ export function normalizeOrderStatus(order) {
 }
 
 export async function placeOrder(items, checkout) {
+  requireCustomerCommerce();
   return backendRequest("/api/orders", {
     items: items.map((item) => ({ productId: item.id, quantity: item.quantity })),
     customer: checkout.customer,
@@ -21,7 +31,8 @@ export async function placeOrder(items, checkout) {
   });
 }
 
-export function getCheckoutQuote(items, checkout) {
+export async function getCheckoutQuote(items, checkout) {
+  requireCustomerCommerce();
   return backendRequest("/api/checkout/quote", {
     items: items.map((item) => ({ productId: item.id, quantity: item.quantity })),
     customer: checkout.customer,
@@ -50,22 +61,27 @@ export function subscribeToOrder(orderId, onChange, onError) {
 }
 
 export async function updateOrderStatus(orderId, status) {
+  requireCustomerCommerce();
   return backendRequest("/api/admin/orders/status", { orderId, status });
 }
 
 export async function syncShiprocketOrder(orderId) {
+  requireCustomerCommerce();
   return backendRequest("/api/shiprocket/orders", { orderId });
 }
 
 export function cancelPendingOrder(orderId) {
+  requireCustomerCommerce();
   return backendRequest("/api/orders/cancel", { orderId });
 }
 
 export function cancelOrderItems(orderId, items, requestId = crypto.randomUUID()) {
+  requireCustomerCommerce();
   return backendRequest("/api/orders/cancel-items", { orderId, items, requestId });
 }
 
-export function createPhonePeCheckout(orderId) {
+export async function createPhonePeCheckout(orderId) {
+  requireCustomerCommerce();
   return backendRequest("/api/phonepe/orders", { orderId });
 }
 
@@ -105,9 +121,9 @@ export async function backendRequest(path, body, method = "POST") {
   const user = auth.currentUser;
   if (!user) throw new Error("Sign in is required to process shipping.");
   const token = await user.getIdToken();
-  const baseUrl = (import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_API_URL || "http://localhost:8787").replace(/\/$/, "");
-  const response = await fetch(`${baseUrl}${path}`, {
+  const response = await fetch(`${BACKEND_API_URL}${path}`, {
     method,
+    cache: "no-store",
     headers: { ...(method !== "GET" ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     ...(method !== "GET" ? { body: JSON.stringify(body || {}) } : {}),
   });
@@ -116,15 +132,18 @@ export async function backendRequest(path, body, method = "POST") {
   return result;
 }
 
-export function createRazorpayOrder(orderId) {
+export async function createRazorpayOrder(orderId) {
+  requireCustomerCommerce();
   return backendRequest("/api/razorpay/orders", { orderId });
 }
 
-export function verifyRazorpayPayment(orderId, payment) {
+export async function verifyRazorpayPayment(orderId, payment) {
+  requireCustomerCommerce();
   return backendRequest("/api/razorpay/verify", { orderId, payment });
 }
 
-export function retryShiprocketOrder(orderId) {
+export async function retryShiprocketOrder(orderId) {
+  requireCustomerCommerce();
   return backendRequest("/api/shiprocket/orders", { orderId });
 }
 
@@ -157,6 +176,7 @@ export function createOrderReturnRequest(payload) {
 }
 
 export function reviewOrderReturn(payload) {
+  if (["approved", "pickup_pending", "manual_refund_complete"].includes(payload?.status)) requireCustomerCommerce();
   return backendRequest("/api/admin/returns", payload, "PATCH");
 }
 
@@ -185,14 +205,17 @@ export function updateAdminOrderFinance(orderId, details) {
 }
 
 export function requestAdminRefund(orderId, items, reason, requestId = crypto.randomUUID()) {
+  requireCustomerCommerce();
   return backendRequest("/api/admin/refunds", { orderId, items, reason, requestId });
 }
 
 export function completeManualAdminRefund(refundId, reference) {
+  requireCustomerCommerce();
   return backendRequest(`/api/admin/refunds/${encodeURIComponent(refundId)}/manual-complete`, { reference }, "PATCH");
 }
 
 export function reconcileAdminCodCollection(orderId, amount, reference) {
+  requireCustomerCommerce();
   return backendRequest("/api/admin/orders/cod-collection", { orderId, amount, reference });
 }
 
@@ -239,6 +262,5 @@ export function saveAdminStoreSettings(settings, reason = "Updated store setting
 }
 
 export async function getPublicSiteSettings() {
-  const baseUrl = (import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_API_URL || "http://localhost:8787").replace(/\/$/, "");
-  return fetchPublicSiteSettings(baseUrl);
+  return fetchPublicSiteSettings(BACKEND_API_URL);
 }

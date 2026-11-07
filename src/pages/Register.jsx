@@ -2,6 +2,8 @@ import { useState } from "react";
 import { Check, Eye, EyeOff, Loader2, LockKeyhole, Mail, ShieldAlert, User, Wrench } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/useAuth";
+import { recordLegalAcceptance } from "../services/legalAcceptanceService";
+import { LEGAL_POLICY_PATHS } from "../../shared/legalPolicies.js";
 
 export default function Register() {
   const { signup, loginWithGoogle } = useAuth();
@@ -13,6 +15,9 @@ export default function Register() {
   const [showPassword, setShowPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [acceptedPolicies, setAcceptedPolicies] = useState(false);
+  const [marketingConsent, setMarketingConsent] = useState(false);
+  const [pendingAcceptanceUser, setPendingAcceptanceUser] = useState(null);
 
   const requirements = [
     [password.length >= 6, "6+ characters"],
@@ -33,10 +38,15 @@ export default function Register() {
     }
     setIsSubmitting(true);
     try {
-      await signup(email, password, fullName);
+      const user = await signup(email, password, fullName);
+      setPendingAcceptanceUser(user);
+      await recordLegalAcceptance(user, "customer", marketingConsent);
+      setPendingAcceptanceUser(null);
       navigate("/");
     } catch (error) {
-      setErrorMessage(error.code === "auth/email-already-in-use" ? "This email is already registered. Try signing in." : "We could not create your account. Please try again.");
+      setErrorMessage(error.code === "auth/email-already-in-use"
+        ? "This email is already registered. Try signing in."
+        : error.message || "We could not create your account or record policy acceptance. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -56,12 +66,36 @@ export default function Register() {
 
   async function handleGoogleSignup() {
     setErrorMessage("");
+    if (!acceptedPolicies) {
+      setErrorMessage("Accept the Privacy Policy and General Terms & Conditions to continue.");
+      return;
+    }
     setIsSubmitting(true);
     try {
-      await loginWithGoogle();
+      const user = await loginWithGoogle();
+      setPendingAcceptanceUser(user);
+      await recordLegalAcceptance(user, "customer", marketingConsent);
+      setPendingAcceptanceUser(null);
       navigate("/");
     } catch (error) {
-      setErrorMessage(getGoogleAuthError(error));
+      setErrorMessage(error?.code?.startsWith("auth/")
+        ? getGoogleAuthError(error)
+        : error.message || "We could not record policy acceptance. Please try again.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function retryAcceptance() {
+    if (!pendingAcceptanceUser) return;
+    setIsSubmitting(true);
+    setErrorMessage("");
+    try {
+      await recordLegalAcceptance(pendingAcceptanceUser, "customer", marketingConsent);
+      setPendingAcceptanceUser(null);
+      navigate("/");
+    } catch (error) {
+      setErrorMessage(error.message || "Policy acceptance could not be recorded. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -74,15 +108,24 @@ export default function Register() {
         <div className="auth-brand"><span><Wrench size={18} /></span><strong>PARTSWALA <b>IND</b></strong></div>
         <div className="auth-intro"><p className="auth-kicker">JOIN THE DEPOT / 01</p><h1>Make the road easier.</h1><p>Create an account to move faster through every order.</p></div>
         {errorMessage && <div className="auth-error"><ShieldAlert size={16} /><span>{errorMessage}</span></div>}
+        {pendingAcceptanceUser && <button className="auth-submit" type="button" disabled={isSubmitting} onClick={retryAcceptance}>{isSubmitting ? "Recording acceptance..." : "Retry recording policy acceptance"}</button>}
         <form onSubmit={handleSubmit} className="auth-form">
           <label>Full name<div className="auth-input-with-icon"><User size={16} /><input required value={fullName} onChange={(event) => setFullName(event.target.value)} placeholder="Your name" autoComplete="name" /></div></label>
           <label>Email address<div className="auth-input-with-icon"><Mail size={16} /><input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" autoComplete="email" /></div></label>
           <label>Password<div className="auth-password"><LockKeyhole size={16} /><input required type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Create a password" autoComplete="new-password" /><button type="button" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>
           {password && <div className="auth-requirements">{requirements.map(([valid, label]) => <span className={valid ? "is-valid" : ""} key={label}><Check size={12} />{label}</span>)}</div>}
           <label>Confirm password<div className="auth-input-with-icon"><LockKeyhole size={16} /><input required type={showPassword ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Repeat your password" autoComplete="new-password" /></div></label>
-          <button className="auth-submit" disabled={isSubmitting} type="submit">{isSubmitting ? <Loader2 className="auth-spinner" size={17} /> : "Create account"}</button>
+          <label className="legal-consent-option">
+            <input type="checkbox" required checked={acceptedPolicies} onChange={(event) => setAcceptedPolicies(event.target.checked)} />
+            <span>I have read and agree to the <Link to={LEGAL_POLICY_PATHS.privacy}>Privacy Policy</Link> and <Link to={LEGAL_POLICY_PATHS.terms}>General Terms &amp; Conditions</Link>.</span>
+          </label>
+          <label className="legal-consent-option">
+            <input type="checkbox" checked={marketingConsent} onChange={(event) => setMarketingConsent(event.target.checked)} />
+            <span>Optional: I would like to receive marketing communications. This choice is separate and is not required to create an account.</span>
+          </label>
+          <button className="auth-submit" disabled={isSubmitting || Boolean(pendingAcceptanceUser)} type="submit">{isSubmitting ? <Loader2 className="auth-spinner" size={17} /> : "Create account"}</button>
         </form>
-        <div className="auth-divider"><span>or</span></div><button type="button" onClick={handleGoogleSignup} disabled={isSubmitting} className="auth-google"><span>G</span> Continue with Google</button><p className="auth-switch">Already have an account? <Link to="/login">Sign in</Link></p><Link to="/" className="auth-home">← Back to storefront</Link>
+        <div className="auth-divider"><span>or</span></div><button type="button" onClick={handleGoogleSignup} disabled={isSubmitting || Boolean(pendingAcceptanceUser) || !acceptedPolicies} className="auth-google"><span>G</span> Continue with Google</button><p className="auth-switch">Already have an account? <Link to="/login">Sign in</Link></p><Link to="/" className="auth-home">← Back to storefront</Link>
       </section>
     </main>
   );

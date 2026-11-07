@@ -1,4 +1,9 @@
-const API_URL = (import.meta.env.VITE_AI_API_URL || import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_API_URL || "http://localhost:8787").replace(/\/$/, "");
+import { resolveBackendApiUrl } from "../../services/backendApiUrl.js";
+
+const API_URL = resolveBackendApiUrl({
+  configuredUrl: import.meta.env.VITE_AI_API_URL || import.meta.env.VITE_API_URL || import.meta.env.VITE_BACKEND_API_URL,
+  isProduction: import.meta.env.PROD,
+});
 const inFlight = new Map();
 
 export async function sendAssistantMessage(user, payload) {

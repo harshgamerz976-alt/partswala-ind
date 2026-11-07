@@ -50,6 +50,7 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
   const createdAccounts = [];
   const createdVendorIds = [];
   const createdProductIds = [];
+  const createdImportJobIds = [];
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
@@ -69,6 +70,23 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
     createdAccounts.push(account.idToken);
     createdVendorIds.push(account.localId);
     await database.collection("users").doc(account.localId).set({ role: "vendor", vendorStatus: status });
+    return { uid: account.localId, token: account.idToken };
+  }
+
+  async function createCustomer(profileRole = "customer") {
+    const email = `customer-${randomUUID()}@example.test`;
+    const account = await emulatorRequest(
+      authHost,
+      "/identitytoolkit.googleapis.com/v1/accounts:signUp?key=local-emulator-key",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: "LocalEmulatorPass123!", returnSecureToken: true }),
+      },
+    );
+    createdAccounts.push(account.idToken);
+    createdVendorIds.push(account.localId);
+    await database.collection("users").doc(account.localId).set({ role: profileRole });
     return { uid: account.localId, token: account.idToken };
   }
 
@@ -98,14 +116,44 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
     return { uid: account.localId, token: signedIn.idToken };
   }
 
-  async function importFile(vendor, workbook, confirm = true, claimedVendorId = "") {
+  async function seedImportJob(vendorId, fields = {}) {
+    const reference = database.collection("vendorImportJobs").doc(`import-test-${randomUUID()}`);
+    createdImportJobIds.push(reference.id);
+    await reference.set({
+      ...(vendorId === undefined ? {} : { vendorId }),
+      createdAt: new Date().toISOString(),
+      status: "completed",
+      ...fields,
+    });
+    return reference.id;
+  }
+
+  async function listImportJobs(token) {
+    const response = await fetch(`${api}/api/vendor/import-jobs`, {
+      headers: token ? { Authorization: ["Bearer", token].join(" ") } : {},
+    });
+    return { status: response.status, body: await response.json() };
+  }
+
+  async function importFile(vendor, workbook, confirm = true, claimedVendorId = "", fileName = "vendor-import.xlsx") {
     const form = new FormData();
-    form.append("file", new Blob([workbook], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), "vendor-import.xlsx");
+    form.append("file", new Blob([workbook], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), fileName);
     if (confirm) form.append("confirm", "true");
     if (claimedVendorId) form.append("vendorId", claimedVendorId);
     return fetch(`${api}/api/vendor/import-products`, {
       method: "POST",
       headers: { Authorization: `Bearer ${vendor.token}` },
+      body: form,
+    });
+  }
+
+  async function importOversizedFile(token) {
+    const form = new FormData();
+    form.append("file", new Blob([new Uint8Array(5 * 1024 * 1024 + 1)]), "oversized.xlsx");
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    return fetch(`${api}/api/vendor/import-products`, {
+      method: "POST",
+      headers,
       body: form,
     });
   }
@@ -119,15 +167,18 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
   const workbookRow = (name, partNumber, brand, price = "1250") => {
     const workbook = XLSX.utils.book_new();
     const sheet = XLSX.utils.aoa_to_sheet([
-      ["Part Name", "Part Number", "Brand", "Category", "Price in INR", "MOQ", "Availability"],
-      [name, partNumber, brand, "Filters", price, 1, 5],
+      ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle"],
+      [partNumber, brand, name, 1500, price, 5, "Volvo FM"],
     ]);
     XLSX.utils.book_append_sheet(workbook, sheet, "Products");
     return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
   };
 
   async function deleteVendorData() {
-    const references = createdProductIds.map((productId) => database.collection("products").doc(productId));
+    const references = [
+      ...createdProductIds.map((productId) => database.collection("products").doc(productId)),
+      ...createdImportJobIds.map((jobId) => database.collection("vendorImportJobs").doc(jobId)),
+    ];
     for (const uid of createdVendorIds) {
       const [products, jobs] = await Promise.all([
         database.collection("products").where("sellerId", "==", uid).get(),
@@ -137,9 +188,10 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       references.push(...jobs.docs.map((snapshot) => snapshot.ref));
       references.push(database.collection("users").doc(uid));
     }
-    for (let index = 0; index < references.length; index += 400) {
+    const uniqueReferences = [...new Map(references.map((reference) => [reference.path, reference])).values()];
+    for (let index = 0; index < uniqueReferences.length; index += 400) {
       const batch = database.batch();
-      references.slice(index, index + 400).forEach((reference) => batch.delete(reference));
+      uniqueReferences.slice(index, index + 400).forEach((reference) => batch.delete(reference));
       await batch.commit();
     }
     await Promise.all(createdAccounts.map((idToken) =>
@@ -154,6 +206,44 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
   }
 
   try {
+    await t.test("import-job listing enforces authentication, approved ownership, and verified admin access", async () => {
+      const vendorA = await createVendor();
+      const vendorB = await createVendor();
+      const pendingVendor = await createVendor("pending");
+      const customer = await createCustomer();
+      const profileAdmin = await createCustomer("admin");
+      const admin = await createAdmin();
+      const vendorAJobId = await seedImportJob(vendorA.uid);
+      const vendorBJobId = await seedImportJob(vendorB.uid);
+      const orphanJobId = await seedImportJob(undefined);
+      const malformedOwnerJobId = await seedImportJob(17);
+
+      assert.equal((await listImportJobs()).status, 401);
+      assert.equal((await listImportJobs(customer.token)).status, 403);
+      assert.equal((await listImportJobs(profileAdmin.token)).status, 403);
+      assert.equal((await listImportJobs(pendingVendor.token)).status, 403);
+
+      const vendorAResult = await listImportJobs(vendorA.token);
+      assert.equal(vendorAResult.status, 200);
+      assert.deepEqual(vendorAResult.body.jobs.map(({ id }) => id), [vendorAJobId]);
+      assert.equal(vendorAResult.body.jobs.every(({ vendorId }) => vendorId === vendorA.uid), true);
+      assert.equal(vendorAResult.body.jobs.some(({ id }) => id === vendorBJobId), false);
+      assert.equal(vendorAResult.body.jobs.some(({ id }) => id === orphanJobId), false);
+      assert.equal(vendorAResult.body.jobs.some(({ id }) => id === malformedOwnerJobId), false);
+
+      const vendorBResult = await listImportJobs(vendorB.token);
+      assert.equal(vendorBResult.status, 200);
+      assert.deepEqual(vendorBResult.body.jobs.map(({ id }) => id), [vendorBJobId]);
+
+      const adminResult = await listImportJobs(admin.token);
+      assert.equal(adminResult.status, 200);
+      const adminJobIds = adminResult.body.jobs.map(({ id }) => id);
+      assert.equal(adminJobIds.includes(vendorAJobId), true);
+      assert.equal(adminJobIds.includes(vendorBJobId), true);
+      assert.equal(adminJobIds.includes(orphanJobId), false);
+      assert.equal(adminJobIds.includes(malformedOwnerJobId), false);
+    });
+
     await t.test("approved vendors can download the Excel template; pending vendors cannot", async () => {
       const pendingVendor = await createVendor("pending");
       const pendingResponse = await downloadTemplate(pendingVendor);
@@ -166,7 +256,9 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       assert.match(response.headers.get("content-disposition"), /vendor-product-import-template\.xlsx/);
       const workbook = XLSX.read(Buffer.from(await response.arrayBuffer()), { type: "buffer" });
       assert.equal(workbook.SheetNames[0], "Products");
-      assert.equal(XLSX.utils.sheet_to_json(workbook.Sheets.Products, { header: 1 })[0][0], "Part Name");
+      assert.deepEqual(XLSX.utils.sheet_to_json(workbook.Sheets.Products, { header: 1 })[0], [
+        "Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle",
+      ]);
     });
 
     await t.test("preview requires authentication and derives ownership from the token", async () => {
@@ -175,14 +267,25 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
         body: new FormData(),
       });
       assert.equal(unauthenticated.status, 401);
+      const oversizedUnauthenticated = await importOversizedFile();
+      assert.equal(oversizedUnauthenticated.status, 401);
 
       const vendor = await createVendor();
+      const malformed = await importFile(vendor, Buffer.from("not an Excel workbook"));
+      assert.equal(malformed.status, 400);
+      assert.match((await malformed.json()).message, /could not be read/i);
+
       const response = await importFile(vendor, workbookRow("Preview part", "PREVIEW-100", "Acme"), false, "forged-vendor-id");
       assert.equal(response.status, 200);
       const result = await response.json();
       assert.equal(result.importMode, "preview");
       assert.equal(result.rows[0].sellerId, vendor.uid);
       assert.notEqual(result.rows[0].sellerId, "forged-vendor-id");
+      assert.equal(result.rows[0].name, "Preview part");
+      assert.equal(result.rows[0].description, "Preview part");
+      assert.equal(result.rows[0].mrp, 1500);
+      assert.equal(result.rows[0].price, 1250);
+      assert.deepEqual(result.requiredColumns, ["partNumber", "brand", "description", "mrp", "price", "stock", "compatibility"]);
       assert.equal((await database.collection("products").where("sellerId", "==", vendor.uid).get()).size, 0);
     });
 
@@ -190,8 +293,24 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       const vendor = await createVendor("pending");
       const preview = await importFile(vendor, workbookRow("Pending part", "P-100", "Test"), false);
       const confirmed = await importFile(vendor, workbookRow("Pending part", "P-100", "Test"));
+      const oversized = await importOversizedFile(vendor.token);
       assert.equal(preview.status, 403);
       assert.equal(confirmed.status, 403);
+      assert.equal(oversized.status, 403);
+      assert.equal((await database.collection("products").where("sellerId", "==", vendor.uid).get()).size, 0);
+    });
+
+    await t.test("approved vendor bulk imports are rate-limited before file parsing", async () => {
+      const vendor = await createVendor();
+      const workbook = workbookRow("Rate limit preview", "RATE-LIMIT-100", "Acme");
+      for (let index = 0; index < 20; index += 1) {
+        const response = await importFile(vendor, workbook, false);
+        assert.equal(response.status, 200);
+      }
+
+      const limited = await importOversizedFile(vendor.token);
+      assert.equal(limited.status, 429);
+      assert.match(limited.headers.get("retry-after"), /^\d+$/);
       assert.equal((await database.collection("products").where("sellerId", "==", vendor.uid).get()).size, 0);
     });
 
@@ -244,6 +363,8 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       assert.equal(updated.createdAt, "2025-01-01T00:00:00.000Z");
       assert.equal(updated.name, "New name");
       assert.equal(updated.price, 2750);
+      assert.equal(updated.description, "New name");
+      assert.equal(updated.mrp, 1500);
     });
 
     await t.test("repeated submissions update one listing and retain one import job", async () => {

@@ -7,13 +7,13 @@ export const BULK_IMPORT_LIMITS = {
 };
 
 export const REQUIRED_IMPORT_COLUMNS = [
-  "name",
   "partNumber",
   "brand",
-  "category",
+  "description",
+  "mrp",
   "price",
-  "moq",
-  "availability",
+  "stock",
+  "compatibility",
 ];
 
 const HEADER_ALIASES = {
@@ -34,6 +34,7 @@ const HEADER_ALIASES = {
   "qty": "stock",
   "quantity": "stock",
   "availability": "stock",
+  "availability stock": "stock",
   "stock": "stock",
   "make": "vehicleMake",
   "manufacturer": "vehicleMake",
@@ -45,17 +46,13 @@ const HEADER_ALIASES = {
 };
 
 const IMPORT_TEMPLATE_COLUMNS = [
-  "Part Name",
   "Part Number",
   "Brand",
-  "Category",
   "Description",
-  "Price in INR",
-  "MOQ",
-  "Availability",
-  "Compatible Vehicle Make",
-  "Compatible Vehicle Model",
-  "Compatible Vehicle Year",
+  "MRP",
+  "Selling Price",
+  "Availability/Stock",
+  "Compatible Vehicle",
 ];
 
 function normalizeHeader(rawHeader) {
@@ -96,6 +93,11 @@ function pickValue(row, keys) {
   return "";
 }
 
+function parseImportNumber(value) {
+  const normalized = String(value ?? "").trim().replace(/^(?:₹|INR|Rs\.?)/i, "").replace(/[,\s]/g, "");
+  return /^[-+]?\d+(?:\.\d+)?$/.test(normalized) ? Number(normalized) : Number.NaN;
+}
+
 export function generateVendorBulkImportTemplate() {
   return [IMPORT_TEMPLATE_COLUMNS.join(",")].join("\n");
 }
@@ -118,19 +120,57 @@ export function parseBulkImportFile(buffer, fileName) {
   if (buffer.length > BULK_IMPORT_LIMITS.maxFileSize) {
     throw new Error(`Uploaded file is too large. Maximum size is ${Math.round(BULK_IMPORT_LIMITS.maxFileSize / (1024 * 1024))} MB.`);
   }
+  if (extension === "xlsx" && buffer.subarray(0, 4).toString("hex") !== "504b0304") {
+    throw new Error("The spreadsheet could not be read as a valid CSV or Excel workbook.");
+  }
+  if (extension === "xls" && buffer.subarray(0, 8).toString("hex") !== "d0cf11e0a1b11ae1") {
+    throw new Error("The spreadsheet could not be read as a valid CSV or Excel workbook.");
+  }
 
   let workbook;
-  if (extension === "csv") {
-    workbook = XLSX.read(buffer.toString("utf8"), { type: "string", raw: false, cellDates: true, WTF: false });
-  } else {
-    workbook = XLSX.read(buffer, { type: "array", raw: false, cellDates: true, WTF: false });
+  try {
+    workbook = extension === "csv"
+      ? XLSX.read(buffer.toString("utf8"), {
+        type: "string",
+        raw: false,
+        cellDates: true,
+        WTF: false,
+        sheetRows: BULK_IMPORT_LIMITS.maxRows + 1,
+      })
+      : XLSX.read(buffer, {
+        type: "buffer",
+        raw: false,
+        cellDates: true,
+        WTF: false,
+        sheetRows: BULK_IMPORT_LIMITS.maxRows + 1,
+      });
+  } catch {
+    throw new Error("The spreadsheet could not be read as a valid CSV or Excel workbook.");
   }
   const firstSheetName = workbook.SheetNames[0];
   if (!firstSheetName) {
     throw new Error("The spreadsheet does not contain any worksheet data.");
   }
   const sheet = workbook.Sheets[firstSheetName];
-  const range = sheet && sheet["!ref"] ? XLSX.utils.decode_range(sheet["!ref"]) : null;
+  let range;
+  let fullRange;
+  try {
+    range = sheet && sheet["!ref"] ? XLSX.utils.decode_range(sheet["!ref"]) : null;
+    fullRange = sheet && sheet["!fullref"]
+      ? XLSX.utils.decode_range(sheet["!fullref"])
+      : range;
+  } catch {
+    throw new Error("The spreadsheet could not be read as a valid CSV or Excel workbook.");
+  }
+  if (!range) {
+    throw new Error("The spreadsheet does not contain any worksheet data.");
+  }
+  if (fullRange && fullRange.e.c - fullRange.s.c + 1 > BULK_IMPORT_LIMITS.maxColumns) {
+    throw new Error(`The spreadsheet exceeds the supported column count (${BULK_IMPORT_LIMITS.maxColumns}).`);
+  }
+  if (fullRange && fullRange.e.r - fullRange.s.r + 1 > BULK_IMPORT_LIMITS.maxRows + 1) {
+    throw new Error(`Import exceeds the row limit (${BULK_IMPORT_LIMITS.maxRows}).`);
+  }
   if (range) {
     for (let rowIndex = range.s.r; rowIndex <= range.e.r; rowIndex += 1) {
       for (let colIndex = range.s.c; colIndex <= range.e.c; colIndex += 1) {
@@ -161,6 +201,11 @@ export function parseBulkImportFile(buffer, fileName) {
   if (headerRow.length > BULK_IMPORT_LIMITS.maxColumns) {
     throw new Error(`The spreadsheet exceeds the supported column count (${BULK_IMPORT_LIMITS.maxColumns}).`);
   }
+  const normalizedHeaders = new Set(headerRow.map(normalizeHeader));
+  const missingColumns = REQUIRED_IMPORT_COLUMNS.filter((column) => !normalizedHeaders.has(column));
+  if (missingColumns.length) {
+    throw new Error(`The spreadsheet is missing required columns: ${missingColumns.join(", ")}.`);
+  }
 
   const dataRows = rows.slice(1).filter((row) => Array.isArray(row) && row.some((cell) => String(cell ?? "").trim() !== ""));
   if (dataRows.length === 0) {
@@ -188,15 +233,14 @@ export function parseBulkImportFile(buffer, fileName) {
 
 export function buildVendorImportProduct(row, vendorId) {
   const values = row && typeof row === "object" ? row : {};
-  const name = sanitizeCellValue(pickValue(values, ["name", "product_name", "part_name"]));
+  const description = sanitizeCellValue(pickValue(values, ["description", "product_description", "summary"]));
+  const name = sanitizeCellValue(pickValue(values, ["name", "product_name", "part_name"])) || description;
   const partNumber = sanitizeCellValue(pickValue(values, ["partNumber", "part_number", "sku"]));
   const brand = sanitizeCellValue(pickValue(values, ["brand", "manufacturer"]));
-  const category = sanitizeCellValue(pickValue(values, ["category", "product_category", "category_name"])) || "Other Parts";
-  const description = sanitizeCellValue(pickValue(values, ["description", "product_description", "summary"])) || "";
-  const price = Number(String(pickValue(values, ["price", "selling_price", "price_in_inr"]) || "0").replace(/[^0-9.\-]/g, ""));
-  const mrp = Number(String(pickValue(values, ["mrp", "listed_mrp", "maximum_retail_price"]) || String(price)).replace(/[^0-9.\-]/g, ""));
-  const stockValue = Number(String(pickValue(values, ["stock", "availability", "quantity"]) || "0").replace(/[^0-9.\-]/g, ""));
-  const moqValue = Number(String(pickValue(values, ["moq", "minimum_order_quantity"]) || "1").replace(/[^0-9.\-]/g, ""));
+  const price = parseImportNumber(pickValue(values, ["price", "selling_price", "price_in_inr"]));
+  const mrp = parseImportNumber(pickValue(values, ["mrp", "listed_mrp", "maximum_retail_price"]));
+  const stockValue = parseImportNumber(pickValue(values, ["stock", "availability", "quantity"]));
+  const moqValue = parseImportNumber(pickValue(values, ["moq", "minimum_order_quantity"]) || "1");
   const vehicleMake = sanitizeCellValue(pickValue(values, ["vehicleMake", "make", "manufacturer_name"])) || "";
   const vehicleModel = sanitizeCellValue(pickValue(values, ["vehicleModel", "model"])) || "";
   const vehicleYear = sanitizeCellValue(pickValue(values, ["vehicleYear", "year"])) || "";
@@ -206,10 +250,11 @@ export function buildVendorImportProduct(row, vendorId) {
   if (!name) errors.push("Missing part name.");
   if (!partNumber) errors.push("Missing part number.");
   if (!brand) errors.push("Missing brand.");
-  if (!category) errors.push("Missing category.");
-  if (!Number.isFinite(price) || price <= 0) errors.push("Invalid price in INR.");
-  if (!Number.isFinite(moqValue) || moqValue <= 0) errors.push("Invalid MOQ.");
-  if (!Number.isFinite(stockValue) || stockValue < 0) errors.push("Invalid availability.");
+  if (!Number.isFinite(mrp) || mrp <= 0) errors.push("Invalid MRP in INR.");
+  if (!Number.isFinite(price) || price <= 0) errors.push("Invalid selling price in INR.");
+  if (!Number.isSafeInteger(moqValue) || moqValue <= 0) errors.push("Invalid MOQ.");
+  if (!Number.isSafeInteger(stockValue) || stockValue < 0) errors.push("Invalid availability.");
+  if (!compatibility) errors.push("Missing compatible vehicle.");
 
   if (errors.length) {
     return { valid: false, errors };
@@ -220,10 +265,9 @@ export function buildVendorImportProduct(row, vendorId) {
     name,
     partNumber,
     brand,
-    category,
     description,
     price: Number(price.toFixed(2)),
-    mrp: Number.isFinite(mrp) && mrp > 0 ? Number(mrp.toFixed(2)) : Number(price.toFixed(2)),
+    mrp: Number(mrp.toFixed(2)),
     stock: Math.max(0, Math.round(stockValue)),
     moq: Math.max(1, Math.round(moqValue)),
     compatibility,
@@ -236,6 +280,8 @@ export function buildVendorImportProduct(row, vendorId) {
     updatedAt: new Date().toISOString(),
     vendorImportKey: productKey,
   };
+  const category = sanitizeCellValue(pickValue(values, ["category", "product_category", "category_name"]));
+  if (category) product.category = category;
 
   return { valid: true, product, productKey };
 }

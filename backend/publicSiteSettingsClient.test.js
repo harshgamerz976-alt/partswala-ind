@@ -1,9 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  fetchPublicAssistantSettings,
   fetchPublicSiteSettings,
   SETTINGS_REQUEST_TIMEOUT_MS,
 } from "../shared/publicSiteSettings.js";
+import { getLaunchTargetMs, PARTSWALA_LAUNCH_UTC } from "../shared/preLaunch.js";
+
+const launchTimeMs = getLaunchTargetMs();
+const launchTimeIso = new Date(launchTimeMs).toISOString();
 
 test("public settings requests use the expected backend URL and cold-start timeout", async () => {
   let requestedUrl;
@@ -14,7 +19,12 @@ test("public settings requests use the expected backend URL and cold-start timeo
       requestOptions = options;
       return {
         ok: true,
-        json: async () => ({ preLaunchEnabled: false, comingSoonVideoUrl: "" }),
+        json: async () => ({
+          preLaunchEnabled: false,
+          launchTime: PARTSWALA_LAUNCH_UTC,
+          serverTimeUtc: launchTimeIso,
+          millisecondsUntilLaunch: 0,
+        }),
       };
     },
   });
@@ -23,7 +33,59 @@ test("public settings requests use the expected backend URL and cold-start timeo
   assert.equal(requestOptions.cache, "no-store");
   assert.equal(requestOptions.signal.aborted, false);
   assert.equal(SETTINGS_REQUEST_TIMEOUT_MS, 60000);
-  assert.deepEqual(settings, { preLaunchEnabled: false, comingSoonVideoUrl: "" });
+  assert.deepEqual(settings, {
+    preLaunchEnabled: false,
+    launchTime: PARTSWALA_LAUNCH_UTC,
+    serverTimeUtc: launchTimeIso,
+    millisecondsUntilLaunch: 0,
+  });
+});
+
+test("public assistant settings use a no-store request and expose only enabled", async () => {
+  let endpoint;
+  let options;
+  const result = await fetchPublicAssistantSettings("https://partswala-ind.onrender.com/", {
+    fetchImpl: async (url, requestOptions) => {
+      endpoint = url;
+      options = requestOptions;
+      return { ok: true, json: async () => ({ enabled: false, supportPhone: "not-forwarded" }) };
+    },
+  });
+  assert.equal(endpoint, "https://partswala-ind.onrender.com/api/settings/assistant/public");
+  assert.equal(options.cache, "no-store");
+  assert.deepEqual(result, { enabled: false });
+});
+
+test("public assistant settings reject HTTP errors and malformed data", async () => {
+  await assert.rejects(fetchPublicAssistantSettings("https://partswala-ind.onrender.com", {
+    fetchImpl: async () => ({ ok: false, status: 403, statusText: "Forbidden", json: async () => ({ message: "Not launched." }) }),
+  }), /HTTP 403 Forbidden/);
+  await assert.rejects(fetchPublicAssistantSettings("https://partswala-ind.onrender.com", {
+    fetchImpl: async () => ({ ok: true, json: async () => ({ enabled: "false" }) }),
+  }), /invalid enabled value/);
+});
+
+test("authoritative launch status is validated one millisecond before, exactly at, and after launch", async () => {
+  for (const [serverTimeMs, expectedOpen, expectedRemaining] of [
+    [launchTimeMs - 1, true, 1],
+    [launchTimeMs, false, 0],
+    [launchTimeMs + 1, false, 0],
+  ]) {
+    const settings = await fetchPublicSiteSettings("https://partswala-ind.onrender.com", {
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({
+          preLaunchEnabled: expectedOpen,
+          launchTime: PARTSWALA_LAUNCH_UTC,
+          serverTimeUtc: new Date(serverTimeMs).toISOString(),
+          millisecondsUntilLaunch: expectedRemaining,
+        }),
+      }),
+    });
+    assert.equal(settings.preLaunchEnabled, expectedOpen);
+    assert.equal(settings.serverTimeUtc, new Date(serverTimeMs).toISOString());
+    assert.equal(settings.millisecondsUntilLaunch, expectedRemaining);
+  }
 });
 
 test("settings timeouts report a safe specific failure", async () => {
@@ -61,4 +123,23 @@ test("malformed settings are rejected rather than defaulting the launch gate ope
     }),
     /invalid pre-launch value/,
   );
+});
+
+test("launch status with invalid or inconsistent server timing is rejected closed", async () => {
+  for (const status of [
+    { preLaunchEnabled: false, launchTime: PARTSWALA_LAUNCH_UTC, millisecondsUntilLaunch: 1, serverTimeUtc: launchTimeIso },
+    { preLaunchEnabled: true, launchTime: PARTSWALA_LAUNCH_UTC, millisecondsUntilLaunch: Number.NaN, serverTimeUtc: launchTimeIso },
+    { preLaunchEnabled: false, launchTime: "2026-11-08T00:00:00+05:30", millisecondsUntilLaunch: 0, serverTimeUtc: launchTimeIso },
+    { preLaunchEnabled: true, launchTime: PARTSWALA_LAUNCH_UTC, millisecondsUntilLaunch: 1 },
+    { preLaunchEnabled: true, launchTime: PARTSWALA_LAUNCH_UTC, millisecondsUntilLaunch: 2, serverTimeUtc: new Date(launchTimeMs - 1).toISOString() },
+    { preLaunchEnabled: false, launchTime: PARTSWALA_LAUNCH_UTC, millisecondsUntilLaunch: 0, serverTimeUtc: "not-a-time" },
+    { preLaunchEnabled: false, launchTime: PARTSWALA_LAUNCH_UTC, millisecondsUntilLaunch: 0, serverTimeUtc: "2026-11-07T18:30:00Z" },
+  ]) {
+    await assert.rejects(
+      fetchPublicSiteSettings("https://partswala-ind.onrender.com", {
+        fetchImpl: async () => ({ ok: true, json: async () => status }),
+      }),
+      /invalid authoritative launch status/,
+    );
+  }
 });

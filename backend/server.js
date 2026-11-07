@@ -6,6 +6,7 @@ import express from "express";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldPath, getFirestore } from "firebase-admin/firestore";
+import { getMessaging } from "firebase-admin/messaging";
 import { calculateOrderPricing } from "./pricing.js";
 import { customerFacingPricing } from "./customerPricing.js";
 import { getShiprocketShippingQuote } from "./shipping.js";
@@ -22,7 +23,7 @@ import { buildSellerInvoiceSnapshots } from "./invoices.js";
 import { createRateLimiter } from "./rateLimiter.js";
 import { assertVerifiedCustomerPhone, verifiedPhoneUpdate } from "./phoneVerification.js";
 import { pendingSellerShipments, shipmentAuthorizationProblem } from "./shipmentAuthorization.js";
-import { CLOUDINARY_UPLOAD_LIMIT, cloudinaryCredentialPresence, cloudinaryCredentialsFromEnvironment, signedCloudinaryUpload } from "./cloudinaryUploads.js";
+import { CLOUDINARY_MAX_FILE_BYTES, CLOUDINARY_UPLOAD_LIMIT, cloudinaryCredentialPresence, cloudinaryCredentialsFromEnvironment } from "./cloudinaryUploads.js";
 import { assistantRateLimitDecision, createAssistantLimiters, resolveClientIp } from "./ai/access.js";
 import { resolveLegacySellerOwnership } from "./sellerOwnership.js";
 import { normalizeReturnWindowDays, isReturnWindowOpen } from "../src/services/returnPolicy.js";
@@ -43,8 +44,33 @@ import { adminLifecycleOverrideProblem } from "./adminLifecycle.js";
 import { normalizeFinanceDateRange } from "./financeDateRange.js";
 import { normalizeIndianState, resolveSellerTaxState, validatedDeliveryState } from "./sellerTaxContext.js";
 import { hasValidVendorPickupLocation, normalizeVendorPickupLocation } from "./vendorPickup.js";
+import { isMarketplaceAvailable, rejectMarketplaceBeforeLaunch } from "./marketplaceLaunch.js";
+import { rejectDisabledCommerce } from "./commerceAvailability.js";
+import { createPreLaunchAccessPolicy } from "./preLaunchAccessPolicy.js";
+import { getExplicitPublicVendorWhatsAppNumber } from "./vendorContact.js";
+import { registerLegalAcceptanceRoute } from "./legalAcceptance.js";
 import { registerPublicSettingsRoute } from "./publicSettings.js";
-import { registerPublicProductCatalogRoutes } from "./publicProductCatalogRoutes.js";
+import {
+  eligiblePublicProductDocuments,
+  registerPublicProductCatalogRoutes,
+  setPublicProductCatalogNoStore,
+} from "./publicProductCatalogRoutes.js";
+import {
+  canUseUserNotifications,
+  markAllUserNotificationsRead,
+  markUserNotificationRead,
+  persistSupplierNotification,
+  registerFcmToken,
+  revokeFcmToken,
+  supplierNotification,
+  supplierNotificationId,
+} from "./notifications.js";
+import {
+  canUploadVendorProductImage,
+  uploadValidatedImageToCloudinary,
+  uploadVendorProductImageToCloudinary,
+  VENDOR_PRODUCT_IMAGE_MAX_BYTES,
+} from "./vendorProductImages.js";
 import multer from "multer";
 import {
   BULK_IMPORT_LIMITS,
@@ -60,6 +86,7 @@ const app = express();
 const port = Number(process.env.PORT || 8787);
 const assistantLimiters = createAssistantLimiters();
 const cloudinaryUploadLimiter = createRateLimiter(CLOUDINARY_UPLOAD_LIMIT);
+const vendorBulkImportLimiter = createRateLimiter({ limit: 20, windowMs: 5 * 60 * 1000, maxKeys: 20000 });
 const cloudinaryCredentials = cloudinaryCredentialsFromEnvironment();
 console.info("[Cloudinary] startup configuration:", cloudinaryCredentialPresence(cloudinaryCredentials));
 const reviewLimiter = createRateLimiter({ limit: 5, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
@@ -68,6 +95,15 @@ const publicProductContactLimiter = createRateLimiter({ limit: 60, windowMs: 60 
 const publicProductSellerNameLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const supplierEnquiryLimiter = createRateLimiter({ limit: 10, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
 const supplierEnquiryReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 20000 });
+const notificationActionLimiter = createRateLimiter({ limit: 30, windowMs: 60 * 1000, maxKeys: 20000 });
+const productImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: VENDOR_PRODUCT_IMAGE_MAX_BYTES },
+});
+const mediaImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: CLOUDINARY_MAX_FILE_BYTES },
+});
 const bulkImportUpload = multer({
   storage: multer.memoryStorage(),
   limits: { files: 1, fileSize: BULK_IMPORT_LIMITS.maxFileSize },
@@ -77,6 +113,44 @@ const bulkImportUpload = multer({
     callback(new Error("Unsupported file type. Upload a CSV or Excel workbook (.csv, .xlsx, .xls)."));
   },
 });
+
+async function authorizeVendorBulkImport(request, response, next) {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+
+  try {
+    const snapshot = await getDb().collection("users").doc(user.uid).get();
+    const vendor = snapshot.exists ? snapshot.data() : {};
+    if (vendor.role !== "vendor" || vendor.vendorStatus !== "approved") {
+      return response.status(403).json({ message: "Approved vendor access is required." });
+    }
+    const limit = vendorBulkImportLimiter.check(user.uid);
+    if (!limit.allowed) {
+      response.set("Retry-After", String(Math.ceil(limit.retryAfterMs / 1000)));
+      return response.status(429).json({ message: "Bulk import rate limit exceeded. Try again after the indicated interval." });
+    }
+    response.locals.vendorImportUser = user;
+    return next();
+  } catch (error) {
+    console.error("Vendor bulk import authorization failed:", error);
+    return response.status(503).json({ message: "Vendor access could not be verified." });
+  }
+}
+
+function parseVendorBulkImportFile(request, response, next) {
+  bulkImportUpload.single("file")(request, response, (error) => {
+    if (!error) return next();
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return response.status(413).json({ message: "The uploaded file exceeds the 5 MB limit." });
+    }
+    if (error.code?.startsWith("LIMIT_") || error.message?.startsWith("Unsupported file type.")) {
+      return response.status(400).json({ message: error.message });
+    }
+    console.error("Vendor bulk import upload failed:", error);
+    return response.status(400).json({ message: "The uploaded file could not be parsed." });
+  });
+}
+
 const shiprocketUrl = process.env.SHIPROCKET_API_URL || "https://apiv2.shiprocket.in/v1/external";
 let cachedShiprocketToken = "";
 let shiprocketTokenExpiresAt = 0;
@@ -86,6 +160,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || [
   "http://localhost:5174",
   "http://localhost:5175",
   "http://localhost:3000",
+  "https://partswalaflutter.web.app",
   "https://partswalaind.web.app",
   "https://partswalaind.com",
 ].filter(Boolean).join(",")).split(",").map((entry) => entry.trim()).filter(Boolean);
@@ -96,8 +171,9 @@ const corsOptions = {
       callback(null, true);
       return;
     }
-    console.error(`[CORS] Blocked origin: ${origin}`);
-    callback(new Error(`Origin ${origin} is not allowed by CORS.`));
+    const error = new Error("Origin is not allowed by CORS.");
+    error.code = "CORS_ORIGIN_DENIED";
+    callback(error);
   },
   credentials: true,
   methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
@@ -115,9 +191,14 @@ else if (trustProxySetting === "true") app.set("trust proxy", true);
 else if (trustProxySetting === "false") app.set("trust proxy", false);
 else app.set("trust proxy", trustProxySetting.split(",").map((entry) => entry.trim()).filter(Boolean));
 
+export function setApiNoStore(request, response, next) {
+  if (request.path.toLowerCase().startsWith("/api/")) response.set("Cache-Control", "no-store");
+  next();
+}
+app.use(setApiNoStore);
+app.use(setPublicProductCatalogNoStore);
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
-app.use(express.json({ limit: "1mb", verify: (request, _response, buffer) => { request.rawBody = Buffer.from(buffer); } }));
 app.use((request, response, next) => {
   response.set({
     "Content-Security-Policy": "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
@@ -129,6 +210,8 @@ app.use((request, response, next) => {
   if (request.secure) response.set("Strict-Transport-Security", "max-age=31536000");
   next();
 });
+app.use(createPreLaunchAccessPolicy({ now: () => getServerTimeMs() }));
+app.use(express.json({ limit: "1mb", verify: (request, _response, buffer) => { request.rawBody = Buffer.from(buffer); } }));
 
 function requireEnv(names) {
   const missing = names.filter((name) => !process.env[name]);
@@ -327,6 +410,65 @@ async function releaseInventoryReservation(transaction, db, order, timestamp) {
 
 function isAdminUser(user) {
   return hasAdminClaim(user);
+}
+
+function getServerTimeMs() {
+  const launchClock = app.locals.launchClock;
+  return typeof launchClock === "function" ? launchClock() : Date.now();
+}
+
+function rejectPreLaunchMarketplaceRequest(response, options = {}) {
+  return rejectMarketplaceBeforeLaunch(response, {
+    ...options,
+    now: getServerTimeMs(),
+  });
+}
+
+async function canUseNotificationsForUser(database, user) {
+  if (isAdminUser(user)) return false;
+  const snapshot = await database.collection("users").doc(user.uid).get();
+  return snapshot.exists && canUseUserNotifications(snapshot.data(), false);
+}
+
+async function recordSupplierNotification(database, recipientId, type, eventKey, productName, enquiryId, createdAt) {
+  if (typeof recipientId !== "string" || !recipientId.trim()) return;
+  try {
+    const notification = supplierNotification({
+      id: supplierNotificationId(type, eventKey),
+      type,
+      productName,
+      enquiryId,
+      createdAt,
+    });
+    const result = await persistSupplierNotification({
+      database,
+      messaging: getMessaging(),
+      recipientId,
+      notification,
+    });
+    if (result.failed.length) console.warn("Some supplier notification devices could not be reached.", result.failed.length);
+  } catch (error) {
+    console.warn("Supplier notification delivery could not complete.", error?.code || error?.message || "messaging_error");
+  }
+}
+
+async function checkNotificationAccess(response, user) {
+  const limit = notificationActionLimiter.check(`uid:${user.uid}`);
+  if (!limit.allowed) {
+    response.status(429).json({ message: "Too many notification requests. Try again shortly." });
+    return false;
+  }
+  try {
+    if (!await canUseNotificationsForUser(getDb(), user)) {
+      response.status(403).json({ message: "Customer or approved vendor access is required." });
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("Notification account access could not be verified.", error?.code || "firestore_error");
+    response.status(503).json({ message: "Notifications are temporarily unavailable." });
+    return false;
+  }
 }
 
 function stageAdminAudit(transaction, db, user, { action, entityType, entityId, oldValue = null, newValue = null, reason = "", timestamp = new Date().toISOString() }) {
@@ -709,10 +851,12 @@ function normalizeCustomer(payload, user) {
   return customer;
 }
 app.get("/health", (_request, response) => response.json({ ok: true, service: "partswala-ind-backend" }));
-registerPublicSettingsRoute(app, getDb);
-registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp });
+registerPublicSettingsRoute(app, getDb, getServerTimeMs);
+registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp, now: getServerTimeMs });
+registerLegalAcceptanceRoute(app, { authenticatedUser, getDb });
 
 app.get("/api/products/:productId/vendor-contact", async (request, response) => {
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   const productId = String(request.params.productId || "").trim();
   if (!productId || productId.length > 200) return response.status(400).json({ message: "A valid product ID is required." });
   const limit = publicProductContactLimiter.check(`ip:${resolveClientIp(request)}`);
@@ -721,19 +865,19 @@ app.get("/api/products/:productId/vendor-contact", async (request, response) => 
     const db = getDb();
     const productSnapshot = await db.collection("products").doc(productId).get();
     if (!productSnapshot.exists) return response.status(404).json({ message: "Product not found." });
-    const product = productSnapshot.data();
-    if (product.sellerType !== "vendor" || !product.sellerId) return response.json({ whatsAppNumber: null });
+    const [eligibleProduct] = await eligiblePublicProductDocuments(db, [productSnapshot]);
+    if (!eligibleProduct) return response.status(404).json({ message: "Product not found." });
+    const product = eligibleProduct.product;
+    if (String(product.sellerType || "").toLowerCase() !== "vendor" || !product.sellerId) {
+      return response.json({ whatsAppNumber: null });
+    }
     const vendorSnapshot = await db.collection("users").doc(String(product.sellerId)).get();
     const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
     if (!vendorSnapshot.exists || vendor.role !== "vendor" || vendor.vendorStatus !== "approved") return response.json({ whatsAppNumber: null });
     const vendorProfile = vendor.vendorProfile || {};
-    const publicNumber = product.publicWhatsAppNumber || product.vendorWhatsAppNumber || product.whatsAppNumber || vendorProfile.publicWhatsAppNumber || vendorProfile.whatsAppNumber || "";
-    let digits = String(publicNumber).replace(/\D/g, "");
-    if (digits.length === 10) digits = `91${digits}`;
-    else if (digits.length === 11 && digits.startsWith("0")) digits = `91${digits.slice(1)}`;
-    const isValidIndianNumber = digits.length === 12 && digits.startsWith("91");
-    const isValidInternationalNumber = digits.length >= 8 && digits.length <= 15;
-    return response.json({ whatsAppNumber: isValidIndianNumber || isValidInternationalNumber ? digits : null });
+    return response.json({
+      whatsAppNumber: getExplicitPublicVendorWhatsAppNumber(product, vendorProfile),
+    });
   } catch (error) {
     console.error("Public product seller contact could not be loaded:", error?.message || error);
     return response.status(500).json({ message: "Seller contact information is unavailable." });
@@ -741,6 +885,7 @@ app.get("/api/products/:productId/vendor-contact", async (request, response) => 
 });
 
 app.post("/api/products/vendor-names", async (request, response) => {
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   const productIds = request.body?.productIds;
   if (!Array.isArray(productIds) || productIds.length < 1 || productIds.length > 100
     || productIds.some((productId) => !isValidSupplierDocumentId(productId))) {
@@ -756,30 +901,18 @@ app.post("/api/products/vendor-names", async (request, response) => {
       const references = productIds.slice(index, index + 100).map((productId) => db.collection("products").doc(productId));
       productSnapshots.push(...await db.getAll(...references));
     }
-    const vendorProductCandidates = productSnapshots.filter((snapshot) => {
-      if (!snapshot.exists) return false;
-      const product = snapshot.data();
-      return String(product.sellerType || "").trim().toLowerCase() === "vendor"
-        && typeof product.sellerId === "string"
-        && Boolean(product.sellerId.trim());
-    });
-    const vendorIds = [...new Set(vendorProductCandidates.map((snapshot) => snapshot.data().sellerId.trim()))];
-    const vendorSnapshots = [];
-    for (let index = 0; index < vendorIds.length; index += 300) {
-      const references = vendorIds.slice(index, index + 300).map((vendorId) => db.collection("users").doc(vendorId));
-      vendorSnapshots.push(...await db.getAll(...references));
-    }
-    const vendorById = new Map(vendorSnapshots.map((snapshot) => [snapshot.id, snapshot.exists ? snapshot.data() : null]));
-    const eligibleVendorProducts = vendorProductCandidates.filter((snapshot) =>
-      isEligibleVendorEnquiryProduct(snapshot.data(), vendorById.get(snapshot.data().sellerId.trim()))
-    );
+    const eligibleVendorProducts = (await eligiblePublicProductDocuments(db, productSnapshots))
+      .filter(({ product }) => String(product.sellerType || "").toLowerCase() === "vendor");
     const names = {};
-    for (const productSnapshot of eligibleVendorProducts) {
-      const vendor = vendorById.get(productSnapshot.data().sellerId.trim());
-      const businessName = String(vendor?.vendorProfile?.businessName || "").trim();
-      if (businessName) names[productSnapshot.id] = businessName;
+    for (const eligibleProduct of eligibleVendorProducts) {
+      if (eligibleProduct.vendorBusinessName) {
+        names[eligibleProduct.document.id] = eligibleProduct.vendorBusinessName;
+      }
     }
-    return response.json({ names, eligibleProductIds: eligibleVendorProducts.map((snapshot) => snapshot.id) });
+    return response.json({
+      names,
+      eligibleProductIds: eligibleVendorProducts.map(({ document }) => document.id),
+    });
   } catch (error) {
     console.error("Public product seller names could not be loaded:", error?.code || "firestore_error");
     return response.status(500).json({ message: "Seller business names could not be loaded." });
@@ -789,6 +922,7 @@ app.post("/api/products/vendor-names", async (request, response) => {
 app.post("/api/vendor/enquiries", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   const rate = supplierEnquiryLimiter.check(`user:${user.uid}`);
   if (!rate.allowed) return response.status(429).json({ message: "Too many enquiries. Try again later." });
   let input;
@@ -807,7 +941,7 @@ app.post("/api/vendor/enquiries", async (request, response) => {
     }
     const now = new Date().toISOString();
     const enquiryRef = db.collection("vendorEnquiries").doc();
-    await db.runTransaction(async (transaction) => {
+    const notificationContext = await db.runTransaction(async (transaction) => {
       const buyerRef = db.collection("users").doc(user.uid);
       const productRef = db.collection("products").doc(input.productId);
       const [buyerSnapshot, productSnapshot] = await Promise.all([
@@ -841,7 +975,20 @@ app.post("/api/vendor/enquiries", async (request, response) => {
         createdAt: now,
         updatedAt: now,
       });
+      return {
+        vendorId,
+        productName: String(product.name || product.title || "").trim(),
+      };
     });
+    await recordSupplierNotification(
+      db,
+      notificationContext.vendorId,
+      "vendor-enquiry",
+      enquiryRef.id,
+      notificationContext.productName,
+      enquiryRef.id,
+      now,
+    );
     return response.status(201).json({ enquiryId: enquiryRef.id, status: "new" });
   } catch (error) {
     if (error.message === "BUYER_NOT_ALLOWED") return response.status(403).json({ message: "Customer or approved vendor access is required to send an enquiry." });
@@ -893,6 +1040,7 @@ app.get("/api/enquiries", async (request, response) => {
     if (!canCreateSupplierEnquiry(buyer, isAdminUser(user))) {
       return response.status(403).json({ message: "Customer or approved vendor access is required." });
     }
+    if (buyer.role === "customer" && rejectPreLaunchMarketplaceRequest(response)) return;
     return listSupplierEnquiries(request, response, "buyerId", user.uid);
   } catch (error) {
     console.error("Buyer enquiry access could not be verified:", error?.code || "firestore_error");
@@ -933,7 +1081,7 @@ app.patch("/api/vendor/enquiries/:enquiryId/quote", async (request, response) =>
     const db = getDb();
     const enquiryRef = db.collection("vendorEnquiries").doc(enquiryId);
     const updatedAt = new Date().toISOString();
-    await db.runTransaction(async (transaction) => {
+    const notificationContext = await db.runTransaction(async (transaction) => {
       const vendorRef = db.collection("users").doc(user.uid);
       const [vendorSnapshot, enquirySnapshot] = await Promise.all([
         transaction.get(vendorRef),
@@ -955,7 +1103,18 @@ app.patch("/api/vendor/enquiries/:enquiryId/quote", async (request, response) =>
         quotedAt: updatedAt,
         updatedAt,
       });
+      const enquiry = enquirySnapshot.data();
+      return { buyerId: enquiry.buyerId, productName: enquiry.productName || "" };
     });
+    await recordSupplierNotification(
+      db,
+      notificationContext.buyerId,
+      "customer-reply",
+      enquiryId,
+      notificationContext.productName,
+      enquiryId,
+      updatedAt,
+    );
     return response.json({ enquiryId, status: "quoted", quoteAmount: quote.amount });
   } catch (error) {
     if (error.message === "VENDOR_NOT_APPROVED") return response.status(403).json({ message: "Approved vendor access is required." });
@@ -967,12 +1126,18 @@ app.patch("/api/vendor/enquiries/:enquiryId/quote", async (request, response) =>
 });
 
 app.get("/api/reviews", async (request, response) => {
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   const productId = String(request.query.productId || "").trim();
-  if (!productId || productId.length > 200) return response.status(400).json({ message: "A valid product ID is required." });
+  if (!isValidSupplierDocumentId(productId)) return response.status(400).json({ message: "A valid product ID is required." });
   const limit = reviewReadLimiter.check(`ip:${resolveClientIp(request)}`);
   if (!limit.allowed) return response.status(429).json({ message: "Too many review requests. Try again shortly." });
   try {
-    const snapshot = await getDb().collection("reviews").where("productId", "==", productId).orderBy("createdAt", "desc").limit(100).get();
+    const db = getDb();
+    const productSnapshot = await db.collection("products").doc(productId).get();
+    if (!productSnapshot.exists) return response.status(404).json({ message: "Product not found." });
+    const [eligibleProduct] = await eligiblePublicProductDocuments(db, [productSnapshot]);
+    if (!eligibleProduct) return response.status(404).json({ message: "Product not found." });
+    const snapshot = await db.collection("reviews").where("productId", "==", productId).orderBy("createdAt", "desc").limit(100).get();
     return response.json({ reviews: snapshot.docs.map((document) => publicReview(document.data(), document.id)) });
   } catch (error) {
     console.error("Public product reviews could not be loaded.", error?.code || "firestore_error");
@@ -981,6 +1146,7 @@ app.get("/api/reviews", async (request, response) => {
 });
 
 app.post("/api/reviews", async (request, response) => {
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   const user = await authenticatedUser(request, response);
   if (!user) return;
   const limit = reviewLimiter.check(`uid:${user.uid}`);
@@ -995,6 +1161,8 @@ app.post("/api/reviews", async (request, response) => {
     const db = getDb();
     const productSnapshot = await db.collection("products").doc(review.productId).get();
     if (!productSnapshot.exists) return response.status(404).json({ message: "Product not found." });
+    const [eligibleProduct] = await eligiblePublicProductDocuments(db, [productSnapshot]);
+    if (!eligibleProduct) return response.status(404).json({ message: "Product not found." });
 
     let cursor = null;
     let hasDeliveredPurchase = false;
@@ -1068,33 +1236,216 @@ app.post("/api/phone/verification", async (request, response) => {
   }
 });
 
-app.post("/api/uploads/cloudinary/signature", async (request, response) => {
+app.post("/api/notifications/fcm-token", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (!await checkNotificationAccess(response, user)) return;
+  try {
+    return response.json(await registerFcmToken(getDb(), user.uid, request.body?.token));
+  } catch (error) {
+    if (error.message === "A valid notification token is required.") {
+      return response.status(400).json({ message: error.message });
+    }
+    console.error("Notification token could not be registered.", error?.code || "firestore_error");
+    return response.status(503).json({ message: "Notifications could not be enabled." });
+  }
+});
+
+app.delete("/api/notifications/fcm-token", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (!await checkNotificationAccess(response, user)) return;
+  try {
+    return response.json(await revokeFcmToken(getDb(), user.uid, request.body?.token));
+  } catch (error) {
+    if (error.message === "A valid notification token is required.") {
+      return response.status(400).json({ message: error.message });
+    }
+    console.error("Notification token could not be removed.", error?.code || "firestore_error");
+    return response.status(503).json({ message: "The notification device could not be removed." });
+  }
+});
+
+app.patch("/api/notifications/read-all", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (!await checkNotificationAccess(response, user)) return;
+  try {
+    return response.json(await markAllUserNotificationsRead(getDb(), user.uid));
+  } catch (error) {
+    console.error("Notifications could not be marked as read.", error?.code || "firestore_error");
+    return response.status(503).json({ message: "Notifications could not be marked as read." });
+  }
+});
+
+app.patch("/api/notifications/:notificationId/read", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (!await checkNotificationAccess(response, user)) return;
+  const notificationId = String(request.params.notificationId || "").trim();
+  if (!isValidSupplierDocumentId(notificationId)) {
+    return response.status(400).json({ message: "A valid notification ID is required." });
+  }
+  try {
+    const updated = await markUserNotificationRead(getDb(), user.uid, notificationId);
+    if (!updated) return response.status(404).json({ message: "Notification not found." });
+    return response.json({ read: true });
+  } catch (error) {
+    console.error("Notification could not be marked as read.", error?.code || "firestore_error");
+    return response.status(503).json({ message: "Notification could not be marked as read." });
+  }
+});
+
+app.post("/api/vendor/product-images", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const limit = cloudinaryUploadLimiter.check(`uid:${user.uid}`);
+  if (!limit.allowed) {
+    return response.status(429).json({ message: `Too many image uploads. Try again in ${Math.max(1, Math.ceil(limit.retryAfterMs / 1000))} seconds.` });
+  }
+  let profile;
+  try {
+    const profileSnapshot = await getDb().collection("users").doc(user.uid).get();
+    profile = profileSnapshot.exists ? profileSnapshot.data() : null;
+  } catch (error) {
+    console.error("Vendor image upload authorization could not be checked.", error?.code || "firestore_error");
+    return response.status(503).json({ message: "Vendor image uploads are temporarily unavailable." });
+  }
+  const uploadUser = { ...user, isAdmin: isAdminUser(user) };
+  if (!canUploadVendorProductImage(profile, uploadUser)) {
+    return response.status(403).json({ message: "Approved vendor access is required to upload product images." });
+  }
+
+  productImageUpload.single("file")(request, response, async (uploadError) => {
+    if (uploadError) {
+      const tooLarge = uploadError.code === "LIMIT_FILE_SIZE";
+      return response.status(tooLarge ? 413 : 400).json({
+        message: tooLarge ? "Images must be no larger than 5 MB." : "Choose one supported image file.",
+      });
+    }
+    try {
+      if (!request.file) return response.status(400).json({ message: "Choose an image to upload." });
+
+      const productId = typeof request.body?.productId === "string" ? request.body.productId.trim() : "";
+      let product;
+      if (productId) {
+        if (!isValidSupplierDocumentId(productId)) {
+          return response.status(400).json({ message: "A valid product ID is required." });
+        }
+        const productSnapshot = await getDb().collection("products").doc(productId).get();
+        if (!productSnapshot.exists) return response.status(404).json({ message: "Product not found." });
+        product = productSnapshot.data();
+        if (!product.sellerId) {
+          const ownership = await resolveLegacySellerOwnership([productId], async (productIds) => {
+            const links = await getDb().collection("vendorProductLinks").where("productId", "in", productIds).get();
+            return links.docs.map((document) => ({ id: document.id, ...document.data() }));
+          });
+          product = { ...product, ...ownership.get(productId) };
+        }
+        if (!canUploadVendorProductImage(profile, uploadUser, product)) {
+          return response.status(403).json({ message: "You cannot upload images for this product." });
+        }
+      }
+
+      const result = await uploadVendorProductImageToCloudinary({
+        file: request.file,
+        uid: user.uid,
+        cloudinaryCredentials,
+      });
+      return response.status(201).json(result);
+    } catch (error) {
+      if (error.message?.startsWith("Choose ")
+        || error.message?.startsWith("Images ")
+        || error.message?.startsWith("The image contents do not match")) {
+        return response.status(400).json({ message: error.message });
+      }
+      if (error.status) {
+        if (error.status >= 500) console.error("Vendor product image upload failed.", error.code || "upload_error");
+        return response.status(error.status).json({
+          message: error.message,
+          ...(error.code ? { code: error.code } : {}),
+          ...(error.missingVariables ? { missingVariables: error.missingVariables } : {}),
+        });
+      }
+      console.error("Vendor product image upload failed.", error?.code || error?.message || "upload_error");
+      return response.status(502).json({ message: "The product image could not be uploaded. Please try again." });
+    }
+  });
+});
+
+app.post("/api/uploads/cloudinary", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
   const limit = cloudinaryUploadLimiter.check(`uid:${user.uid}`);
   if (!limit.allowed) {
     return response.status(429).json({ message: `Too many media uploads. Try again in ${Math.max(1, Math.ceil(limit.retryAfterMs / 1000))} seconds.` });
   }
-  let role = isAdminUser(user) ? "admin" : "customer";
-  if (role === "customer") {
-    try {
-      const profileSnapshot = await getDb().collection("users").doc(user.uid).get();
-      const profile = profileSnapshot.exists ? profileSnapshot.data() : null;
-      if (profile?.role === "vendor" && profile?.vendorStatus === "approved") role = "vendor";
-    } catch (error) {
-      console.warn("Upload folder role lookup failed:", error?.message || error);
+
+  mediaImageUpload.single("file")(request, response, async (uploadError) => {
+    if (uploadError) {
+      const tooLarge = uploadError.code === "LIMIT_FILE_SIZE";
+      return response.status(tooLarge ? 413 : 400).json({
+        message: tooLarge ? "Images must be no larger than 8 MB." : "Choose one supported image file.",
+      });
     }
-  }
-  const signed = signedCloudinaryUpload({
-    ...cloudinaryCredentials,
-    uid: user.uid,
-    role,
-    purpose: request.body?.purpose,
-    mediaType: request.body?.mediaType,
-    uploadPreset: process.env.CLOUDINARY_UPLOAD_PRESET || "",
+
+    try {
+      if (!request.file) return response.status(400).json({ message: "Choose an image to upload." });
+      const purpose = String(request.body?.purpose || "general").trim().toLowerCase();
+      if (!["general", "profile", "product", "return"].includes(purpose)) {
+        return response.status(400).json({ message: "Choose a supported upload purpose." });
+      }
+
+      const isAdmin = isAdminUser(user);
+      if (purpose === "product" && !isAdmin) {
+        return response.status(403).json({ message: "Admin access is required to upload catalogue product images." });
+      }
+
+      let role = isAdmin ? "admin" : "customer";
+      if (!isAdmin) {
+        try {
+          const profileSnapshot = await getDb().collection("users").doc(user.uid).get();
+          const profile = profileSnapshot.exists ? profileSnapshot.data() : null;
+          if (profile?.role === "vendor" && profile?.vendorStatus === "approved") role = "vendor";
+        } catch (error) {
+          console.error("Media upload authorization could not be checked.", error?.code || "firestore_error");
+          return response.status(503).json({ message: "Image uploads are temporarily unavailable." });
+        }
+      }
+
+      const result = await uploadValidatedImageToCloudinary({
+        file: request.file,
+        uid: user.uid,
+        role,
+        purpose,
+        cloudinaryCredentials,
+      });
+      return response.status(201).json(result);
+    } catch (error) {
+      if (error.message?.startsWith("Choose ")
+        || error.message?.startsWith("Images ")
+        || error.message?.startsWith("The image contents do not match")) {
+        return response.status(400).json({ message: error.message });
+      }
+      if (error.status) {
+        if (error.status >= 500) console.error("Media upload failed.", error.code || "upload_error");
+        return response.status(error.status).json({
+          message: error.message,
+          ...(error.code ? { code: error.code } : {}),
+          ...(error.missingVariables ? { missingVariables: error.missingVariables } : {}),
+        });
+      }
+      console.error("Media upload failed.", error?.code || error?.message || "upload_error");
+      return response.status(502).json({ message: "The image could not be uploaded. Please try again." });
+    }
   });
-  if (signed.status) return response.status(signed.status).json({ message: signed.message, code: signed.code, missingVariables: signed.missingVariables });
-  return response.json(signed);
+});
+
+app.post("/api/uploads/cloudinary/signature", async (request, response) => {
+  return response.status(410).json({
+    code: "DIRECT_UPLOAD_DISABLED",
+    message: "Direct browser uploads are disabled. Send the image to the authenticated upload endpoint.",
+  });
 });
 
 async function requireVerifiedCustomerPhone(db, user, customerPhone, transaction = null) {
@@ -1118,6 +1469,8 @@ function respondToPhoneVerificationError(error, response) {
 app.post("/api/checkout/quote", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
+  if (rejectDisabledCommerce(response)) return;
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   try {
     const db = getDb();
     const requestedPhone = String(request.body?.customer?.phone || "").trim();
@@ -1136,6 +1489,8 @@ app.post("/api/checkout/quote", async (request, response) => {
 app.post("/api/orders", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
+  if (rejectDisabledCommerce(response)) return;
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   try {
     const db = getDb();
     const payload = request.body || {};
@@ -1494,6 +1849,7 @@ app.patch("/api/admin/returns", async (request, response) => {
   if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
   const returnId = String(request.body?.returnId || "").trim();
   const status = String(request.body?.status || "").trim().toLowerCase();
+  if (["approved", "pickup_pending"].includes(status) && rejectDisabledCommerce(response)) return;
   const note = String(request.body?.note || "").trim().slice(0, 1000);
   const allowedStatuses = ["under_review", "pickup_pending", "received", "approved", "rejected", "closed"];
   if (!returnId || !allowedStatuses.includes(status)) return response.status(400).json({ message: "Choose a valid return review status." });
@@ -1676,25 +2032,34 @@ app.get("/api/vendor/import-jobs", async (request, response) => {
   if (!user) return;
   try {
     const db = getDb();
-    const vendorSnapshot = await db.collection("users").doc(user.uid).get();
-    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : {};
-    if (vendor.role !== "vendor" && !isAdminUser(user)) {
-      return response.status(403).json({ message: "Vendor or admin access required." });
+    const isAdmin = isAdminUser(user);
+    if (!isAdmin) {
+      if (typeof user.uid !== "string" || !user.uid.trim()) {
+        return response.status(403).json({ message: "Approved vendor access is required." });
+      }
+      const vendorSnapshot = await db.collection("users").doc(user.uid).get();
+      const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : null;
+      if (!vendor || vendor.role !== "vendor" || vendor.vendorStatus !== "approved") {
+        return response.status(403).json({ message: "Approved vendor access is required." });
+      }
     }
-    const query = vendor.role === "vendor" && vendor.vendorStatus === "approved"
-      ? db.collection("vendorImportJobs").where("vendorId", "==", user.uid).orderBy("createdAt", "desc").limit(20)
-      : db.collection("vendorImportJobs").orderBy("createdAt", "desc").limit(20);
+    let query = db.collection("vendorImportJobs");
+    if (!isAdmin) query = query.where("vendorId", "==", user.uid);
+    query = query.orderBy("createdAt", "desc").limit(20);
     const snapshot = await query.get();
-    return response.json({ jobs: snapshot.docs.map((document) => ({ id: document.id, ...document.data() })) });
+    const jobs = snapshot.docs
+      .map((document) => ({ id: document.id, ...document.data() }))
+      .filter((job) => typeof job.vendorId === "string" && job.vendorId.trim()
+        && (isAdmin || job.vendorId === user.uid));
+    return response.json({ jobs });
   } catch (error) {
     console.error("Vendor import history could not be loaded:", error);
     return response.status(500).json({ message: "Import history could not be loaded." });
   }
 });
 
-app.post("/api/vendor/import-products", bulkImportUpload.single("file"), async (request, response) => {
-  const user = await authenticatedUser(request, response);
-  if (!user) return;
+app.post("/api/vendor/import-products", authorizeVendorBulkImport, parseVendorBulkImportFile, async (request, response) => {
+  const user = response.locals.vendorImportUser;
   const file = request.file;
   if (!file) return response.status(400).json({ message: "A CSV or Excel file is required." });
   try {
@@ -1782,7 +2147,7 @@ app.post("/api/vendor/import-products", bulkImportUpload.single("file"), async (
     if (message === "IMPORT_PRODUCT_IDENTITY_CONFLICT") {
       return response.status(409).json({ message: "A product identity conflict prevented this import. Refresh the preview and try again." });
     }
-    if (message.includes("Unsupported file type") || message.includes("empty") || message.includes("row limit") || message.includes("column count") || message.includes("required header") || message.includes("worksheet") || message.includes("no valid product rows")) {
+    if (message.includes("Unsupported file type") || message.includes("empty") || message.includes("row limit") || message.includes("column count") || message.includes("required header") || message.includes("worksheet") || message.includes("spreadsheet could not be read") || message.includes("no valid product rows")) {
       return response.status(400).json({ message });
     }
     if (message.includes("Malicious spreadsheet content")) {
@@ -2279,6 +2644,26 @@ app.put("/api/admin/settings/store", async (request, response) => {
   return response.json({ ok: true });
 });
 
+app.get("/api/vendor/access", async (request, response) => {
+  response.set("Cache-Control", "no-store");
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  if (isAdminUser(user)) {
+    return response.status(403).json({ approvedVendor: false, message: "Vendor account access is not available to admins." });
+  }
+  try {
+    const snapshot = await getDb().collection("users").doc(user.uid).get();
+    const profile = snapshot.exists ? snapshot.data() : null;
+    if (profile?.role !== "vendor" || profile?.vendorStatus !== "approved") {
+      return response.status(403).json({ approvedVendor: false, message: "Approved vendor access is required." });
+    }
+    return response.json({ approvedVendor: true });
+  } catch (error) {
+    console.error("Vendor access could not be verified.", error?.code || "firestore_error");
+    return response.status(503).json({ message: "Vendor access is temporarily unavailable." });
+  }
+});
+
 app.get("/api/vendor/dashboard", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
@@ -2743,6 +3128,7 @@ app.post("/api/admin/finance/order", async (request, response) => {
   const { action, orderId } = request.body || {};
   if (!orderId || !["costs", "refund", "settle"].includes(action)) return response.status(400).json({ message: "A valid finance action and order ID are required." });
   if (action === "refund") return response.status(400).json({ message: "Refunds require selected order items and quantities. Use the selected-item refund workflow." });
+  if (action === "settle" && rejectDisabledCommerce(response)) return;
   try {
     const db = getDb();
     const orderRef = db.collection("orders").doc(String(orderId));
@@ -3022,6 +3408,7 @@ app.post("/api/admin/refunds", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
   if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
+  if (rejectDisabledCommerce(response)) return;
   const orderId = String(request.body?.orderId || "").trim();
   const requestId = String(request.body?.requestId || "").trim();
   const reason = String(request.body?.reason || "").trim().slice(0, 1000);
@@ -3136,6 +3523,7 @@ app.patch("/api/admin/refunds/:refundId/manual-complete", async (request, respon
   const user = await authenticatedUser(request, response);
   if (!user) return;
   if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
+  if (rejectDisabledCommerce(response)) return;
   const reference = String(request.body?.reference || "").trim().slice(0, 160);
   if (reference.length < 3) return response.status(400).json({ message: "Provide the actual bank/courier refund reference." });
   try {
@@ -3162,6 +3550,7 @@ app.post("/api/admin/orders/status", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
   if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
+  if (rejectDisabledCommerce(response)) return;
   const { orderId, status } = request.body || {};
   const normalizedStatus = normalizeLifecycleStatus(status);
   const overrideProblem = adminLifecycleOverrideProblem(normalizedStatus);
@@ -3257,6 +3646,7 @@ app.post("/api/admin/orders/cod-collection", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
   if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
+  if (rejectDisabledCommerce(response)) return;
   const orderId = String(request.body?.orderId || "").trim();
   const reference = String(request.body?.reference || "").trim().slice(0, 120);
   const amount = Number(request.body?.amount);
@@ -3332,6 +3722,7 @@ app.post("/api/admin/orders/cod-collection", async (request, response) => {
 app.post("/api/orders/cancel-items", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
+  if (rejectDisabledCommerce(response)) return;
   const orderId = String(request.body?.orderId || "").trim();
   const requestId = String(request.body?.requestId || "").trim();
   const requestedItems = Array.isArray(request.body?.items) ? request.body.items : [];
@@ -3593,6 +3984,7 @@ app.post("/api/orders/cancel-items", async (request, response) => {
 app.post("/api/orders/cancel", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
+  if (rejectDisabledCommerce(response)) return;
   const orderId = String(request.body?.orderId || "");
   if (!orderId) return response.status(400).json({ message: "orderId is required" });
   try {
@@ -3626,6 +4018,8 @@ app.post("/api/orders/cancel", async (request, response) => {
 app.post("/api/phonepe/orders", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;
+  if (rejectDisabledCommerce(response)) return;
+  if (rejectPreLaunchMarketplaceRequest(response)) return;
   try {
     requireEnv(["PHONEPE_CHECKOUT_ENDPOINT"]);
     const orderId = String(request.body?.orderId || "");
@@ -3665,6 +4059,8 @@ app.post("/api/razorpay/orders", async (request, response) => {
   try {
     const user = await authenticatedUser(request, response);
     if (!user) return;
+    if (rejectDisabledCommerce(response)) return;
+    if (rejectPreLaunchMarketplaceRequest(response)) return;
     requireEnv(["RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET"]);
     const orderId = String(request.body?.orderId || "");
     if (!orderId) return response.status(400).json({ message: "orderId is required" });
@@ -3700,6 +4096,8 @@ app.post("/api/razorpay/verify", async (request, response) => {
   try {
     const user = await authenticatedUser(request, response);
     if (!user) return;
+    if (rejectDisabledCommerce(response)) return;
+    if (rejectPreLaunchMarketplaceRequest(response)) return;
     requireEnv(["RAZORPAY_KEY_SECRET"]);
     const { orderId: internalOrderId, payment } = request.body || {};
     const { razorpay_order_id: paymentOrderId, razorpay_payment_id: paymentId, razorpay_signature: signature } = payment || {};
@@ -3751,6 +4149,7 @@ app.post("/api/razorpay/verify", async (request, response) => {
 });
 
 app.post("/api/phonepe/webhook", async (request, response) => {
+  if (rejectDisabledCommerce(response)) return;
   try {
     requireEnv(["PHONEPE_WEBHOOK_SECRET"]);
     const suppliedSecret = Buffer.from(String(request.headers["x-api-key"] || ""));
@@ -3811,6 +4210,7 @@ app.post("/api/phonepe/webhook", async (request, response) => {
 });
 
 app.post("/api/razorpay/webhook", async (request, response) => {
+  if (rejectDisabledCommerce(response)) return;
   try {
     requireEnv(["RAZORPAY_WEBHOOK_SECRET"]);
     if (!verifyWebhookSignature(process.env.RAZORPAY_WEBHOOK_SECRET, request.headers["x-razorpay-signature"], request.rawBody)) {
@@ -3883,6 +4283,7 @@ app.post("/api/razorpay/webhook", async (request, response) => {
 });
 
 app.post("/api/shiprocket/orders", async (request, response) => {
+  if (rejectDisabledCommerce(response)) return;
   let orderRef;
   let orderLoaded = false;
   let db;
@@ -4082,6 +4483,7 @@ app.post("/api/shiprocket/orders", async (request, response) => {
 });
 
 async function handleShiprocketWebhook(request, response) {
+  if (rejectDisabledCommerce(response)) return;
   try {
     requireEnv(["SHIPROCKET_WEBHOOK_SECRET"]);
     const suppliedSecret = Buffer.from(String(request.headers["x-api-key"] || ""));
@@ -4242,6 +4644,13 @@ app.post("/api/ai/chat", async (request, response) => {
       return response.status(401).json({ error: error.message || "Authentication required." });
     }
   }
+  if (!isMarketplaceAvailable({
+    now: getServerTimeMs(),
+    isAdmin: isAdminUser(user || {}),
+    allowAdmin: true,
+  })) {
+    return response.status(403).json({ error: "The PartsWalaIND marketplace is not open yet." });
+  }
   const access = assistantRateLimitDecision({ user, ip: resolveClientIp(request), limiters: assistantLimiters });
   if (!access.allowed) {
     response.set("Retry-After", String(access.retryAfterSeconds));
@@ -4291,6 +4700,13 @@ app.post("/api/ai/chat", async (request, response) => {
     const databaseFailure = failureStage === "database";
     return response.status(503).json({ error: databaseFailure ? "I'm having trouble reaching the product database right now. Please try again." : "PARTSWALA AI is unavailable right now. Please try again." });
   }
+});
+
+app.use((error, _request, response, next) => {
+  if (error?.code === "CORS_ORIGIN_DENIED") {
+    return response.status(403).json({ message: "Origin is not allowed." });
+  }
+  return next(error);
 });
 
 export default app;

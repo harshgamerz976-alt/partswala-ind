@@ -32,7 +32,7 @@ test("uploads are restricted to images and to a bounded size", () => {
   assert.deepEqual(signed.allowedFormats, ["jpg", "jpeg", "png", "webp", "avif", "heic"]);
 });
 
-test("signature covers the folder, format list, size cap, and timestamp", () => {
+test("signature binds the account folder and timestamp while server-side upload code enforces the byte cap", () => {
   const base = signedCloudinaryUpload({ ...config, uid: "uid-1", purpose: "product", timestamp: 1700000000 });
   const otherFolder = signedCloudinaryUpload({ ...config, uid: "uid-2", purpose: "product", timestamp: 1700000000 });
   const otherTime = signedCloudinaryUpload({ ...config, uid: "uid-1", purpose: "product", timestamp: 1700000001 });

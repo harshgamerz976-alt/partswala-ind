@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { db } from "../firebase";
-import { collection, getDocs, limit, query } from "firebase/firestore";
+import { getProductsPage } from "../services/productService";
+
 import { useAuth } from "../context/useAuth";
 import ProductCard from "../components/productcard";
 import Stats from "../components/Stats";
@@ -71,7 +71,7 @@ function HomeIntro() {
         <p className="parts-eyebrow">THE PARTS DEPOT / 01</p>
         <h1>Parts that keep India moving.</h1>
         <p className="parts-hero-description">
-          Genuine truck components, matched to your machine and delivered without the guesswork.
+          Find commercial vehicle parts, confirm fitment with suppliers, and request a quote.
         </p>
         <div className="parts-hero-actions">
           <Link to="/products" className="parts-primary-action"><span className="parts-primary-action-text">Browse parts</span><span className="parts-primary-action-arrow">↗</span></Link>
@@ -83,61 +83,12 @@ function HomeIntro() {
   );
 }
 
-const demoProducts = [
-  {
-    id: "demo-engine-parts",
-    name: "Brake System",
-    title: "Brake System",
-    category: "Engine Parts",
-    partNumber: "BP-001",
-    price: 1999,
-    stock: 12,
-    imageUrl: "https://images.unsplash.com/photo-1581092580497-e0d23cbdf1dc?q=80&w=1200&auto=format&fit=crop",
-    badge: "POPULAR",
-    tags: ["bestseller"],
-  },
-  {
-    id: "demo-clutch",
-    name: "Clutch Plate",
-    title: "Clutch Plate",
-    category: "clutch",
-    partNumber: "CP-1234",
-    price: 5800,
-    stock: 8,
-    imageUrl: "https://images.unsplash.com/photo-1553440569-bcc63803a83d?q=80&w=1200&auto=format&fit=crop",
-    badge: "POPULAR",
-    tags: ["bestseller"],
-  },
-  {
-    id: "demo-brakes",
-    name: "Front Disc Brake Pad Set",
-    title: "Front Disc Brake Pad Set",
-    category: "Brakes",
-    partNumber: "BP-002",
-    price: 1999,
-    stock: 10,
-    imageUrl: "https://images.unsplash.com/photo-1489824904134-891ab64532f1?q=80&w=1200&auto=format&fit=crop",
-    badge: "POPULAR",
-    tags: ["bestseller"],
-  },
-  {
-    id: "demo-suspension",
-    name: "Suspension Kit",
-    title: "Suspension Kit",
-    category: "Suspension",
-    partNumber: "SK-120",
-    price: 2500,
-    stock: 5,
-    imageUrl: "https://images.unsplash.com/photo-1517524206127-48bbd363f3d7?q=80&w=1200&auto=format&fit=crop",
-    badge: "POPULAR",
-    tags: ["popular"],
-  },
-];
-
 export default function Home() {
   const { isAdmin } = useAuth();
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [reloadCount, setReloadCount] = useState(0);
   const [selectedCategory, setSelectedCategory] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -176,26 +127,27 @@ export default function Home() {
   }
 
   useEffect(() => {
+    let active = true;
     const fetchProducts = async () => {
+      setLoading(true);
+      setLoadError(false);
+      setProducts([]);
       try {
-        const q = query(collection(db, "products"), limit(8));
-        const querySnapshot = await getDocs(q);
-        const productList = querySnapshot.docs.map((doc) => ({
-          id: doc.id,
-          ...doc.data(),
-        }));
-
-        setProducts(productList.length ? productList : demoProducts);
+        const { products: productList } = await getProductsPage(null, 8);
+        if (active) setProducts(productList);
       } catch (error) {
         console.error("Error fetching featured products:", error);
-        setProducts(demoProducts);
+        if (active) setLoadError(true);
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     };
 
     fetchProducts();
-  }, []);
+    return () => {
+      active = false;
+    };
+  }, [reloadCount]);
 
   return (
       <div className="min-h-screen bg-[#020514] text-white">
@@ -228,9 +180,9 @@ export default function Home() {
         <section className="featured-section reveal-on-scroll" id="featured-products">
           <div className="featured-heading">
             <div>
-              <p className="featured-eyebrow">CURATED FOR THE ROAD / 02</p>
-              <h2>Featured <span className="text-gradient">Products</span></h2>
-              <p className="featured-subtitle">Dependable components selected for demanding journeys.</p>
+              <p className="featured-eyebrow">LATEST CATALOGUE / 02</p>
+              <h2>Recently listed <span className="text-gradient">Parts</span></h2>
+              <p className="featured-subtitle">Review part details and request pricing, availability, and fitment information from suppliers.</p>
             </div>
             <Link to="/products" className="featured-view-all">View all parts <span>↗</span></Link>
           </div>
@@ -272,6 +224,13 @@ export default function Home() {
 
           {loading ? (
             <div className="featured-empty reveal-on-scroll">Loading products...</div>
+          ) : loadError ? (
+            <div className="featured-empty" role="alert">
+              <p>Product listings could not be loaded. Please try again.</p>
+              <button type="button" onClick={() => setReloadCount((count) => count + 1)}>Try again</button>
+            </div>
+          ) : products.length === 0 ? (
+            <div className="featured-empty" role="status">No products are available right now.</div>
           ) : filteredProducts.length > 0 ? (
             <div className="featured-grid reveal-on-scroll">
               {filteredProducts.map((product) => (

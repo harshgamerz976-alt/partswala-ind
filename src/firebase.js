@@ -3,7 +3,7 @@ import { getAuth } from "firebase/auth";
 // Replaced getFirestore with initializeFirestore for advanced cache management
 import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager } from "firebase/firestore";
 
-const firebaseConfig = {
+export const firebaseConfig = {
   apiKey: "AIzaSyDupGOm4Ubay7wKIoRVMYpp0UUyBEZme1g",
   authDomain: "partswalaflutter.firebaseapp.com",
   projectId: "partswalaflutter",
@@ -18,7 +18,7 @@ if (import.meta.env.DEV && import.meta.env.VITE_FIREBASE_PHONE_AUTH_TESTING === 
   auth.settings.appVerificationDisabledForTesting = true;
 }
 
-// Enabled offline persistence storage so Firestore caches data directly in the browser
+// Persistent cache supports offline use; server rules cannot revoke data already stored on a device.
 export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({
     tabManager: persistentMultipleTabManager() // Keeps data synced perfectly if you open the app in multiple browser tabs

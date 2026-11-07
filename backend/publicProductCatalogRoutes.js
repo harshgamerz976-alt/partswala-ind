@@ -4,6 +4,7 @@ import { resolveLegacySellerOwnership } from "./sellerOwnership.js";
 import { isEligibleVendorEnquiryProduct, isValidSupplierDocumentId } from "./vendorEnquiries.js";
 import { sanitizePublicProduct } from "./productPrivacy.js";
 import { normalizePublicProductForEligibility } from "./publicProductEligibility.js";
+import { rejectMarketplaceBeforeLaunch } from "./marketplaceLaunch.js";
 
 const publicProductCatalogLimiter = createRateLimiter({
   limit: 120,
@@ -11,7 +12,15 @@ const publicProductCatalogLimiter = createRateLimiter({
   maxKeys: 10000,
 });
 
-function eligiblePublicProductDocuments(database, documents) {
+export function setPublicProductCatalogNoStore(request, response, next) {
+  const requestPath = request.path.toLowerCase();
+  if (requestPath === "/api/public-products" || requestPath.startsWith("/api/public-products/")) {
+    response.set("Cache-Control", "no-store");
+  }
+  next();
+}
+
+export function eligiblePublicProductDocuments(database, documents) {
   const legacyProductIds = documents
     .filter((document) => document.exists && !document.data()?.sellerType)
     .map((document) => document.id);
@@ -52,6 +61,7 @@ function eligiblePublicProductDocuments(database, documents) {
           || isEligibleVendorEnquiryProduct(product, vendorsById.get(product.sellerId)))
         .map(({ document, product }) => ({
           document,
+          product,
           vendorBusinessName: product.sellerType.toLowerCase() === "vendor"
             ? String(vendorsById.get(product.sellerId)?.vendorProfile?.businessName || "").trim()
             : "",
@@ -72,16 +82,17 @@ function publicProductRecord({ document, vendorBusinessName }) {
   });
 }
 
-export function registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp }) {
-  function allowPublicProductCatalogRead(request, response) {
-    const limit = publicProductCatalogLimiter.check(`ip:${resolveClientIp(request)}`);
-    if (limit.allowed) return true;
-    response.status(429).json({ message: "Too many product catalogue requests. Try again shortly." });
-    return false;
-  }
+function allowPublicProductCatalogRead(request, response, resolveClientIp, now) {
+  if (rejectMarketplaceBeforeLaunch(response, { now: now() })) return false;
+  const limit = publicProductCatalogLimiter.check(`ip:${resolveClientIp(request)}`);
+  if (limit.allowed) return true;
+  response.status(429).json({ message: "Too many product catalogue requests. Try again shortly." });
+  return false;
+}
 
+export function registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp, now = Date.now }) {
   app.get("/api/public-products", async (request, response) => {
-    if (!allowPublicProductCatalogRead(request, response)) return;
+    if (!allowPublicProductCatalogRead(request, response, resolveClientIp, now)) return;
     const after = String(request.query.after || "").trim();
     const category = String(request.query.category || "").trim();
     const requestedLimit = request.query.limit === undefined ? 100 : Number(request.query.limit);
@@ -124,7 +135,7 @@ export function registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp
   });
 
   app.post("/api/public-products/by-ids", async (request, response) => {
-    if (!allowPublicProductCatalogRead(request, response)) return;
+    if (!allowPublicProductCatalogRead(request, response, resolveClientIp, now)) return;
     const productIds = request.body?.productIds;
     if (!Array.isArray(productIds) || productIds.length < 1 || productIds.length > 100
       || productIds.some((productId) => !isValidSupplierDocumentId(productId))) {
@@ -145,7 +156,7 @@ export function registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp
   });
 
   app.get("/api/public-products/:productId", async (request, response) => {
-    if (!allowPublicProductCatalogRead(request, response)) return;
+    if (!allowPublicProductCatalogRead(request, response, resolveClientIp, now)) return;
     const productId = String(request.params.productId || "").trim();
     if (!isValidSupplierDocumentId(productId)) {
       return response.status(400).json({ message: "A valid product ID is required." });

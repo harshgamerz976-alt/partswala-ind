@@ -1,18 +1,20 @@
 import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/useAuth';
-import { useCart } from '../context/useCart';
 import { getProductsPage } from '../services/productService';
+import NotificationBell from './NotificationBell.jsx';
 
 const PistonAssembly3D = lazy(() => import('./PistonAssembly3D'));
 
 export default function Header() {
   const { user, userProfile, isVendor, isAdmin } = useAuth();
-  const { getCartCount } = useCart();
   const navigate = useNavigate();
   const [scrollProgress, setScrollProgress] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchProducts, setSearchProducts] = useState([]);
+  const [searchProductsLoading, setSearchProductsLoading] = useState(true);
+  const [searchProductsError, setSearchProductsError] = useState(false);
+  const [searchReloadCount, setSearchReloadCount] = useState(0);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [showPiston, setShowPiston] = useState(false);
   const searchRef = useRef(null);
@@ -36,13 +38,22 @@ export default function Header() {
 
   useEffect(() => {
     let isMounted = true;
+    setSearchProductsLoading(true);
+    setSearchProductsError(false);
 
     getProductsPage(null, 100)
       .then((page) => {
-        if (isMounted) setSearchProducts(page.products || []);
+        if (isMounted) setSearchProducts(page.products);
       })
-      .catch(() => {
-        if (isMounted) setSearchProducts([]);
+      .catch((error) => {
+        console.error('Header product search could not be loaded:', error);
+        if (isMounted) {
+          setSearchProducts([]);
+          setSearchProductsError(true);
+        }
+      })
+      .finally(() => {
+        if (isMounted) setSearchProductsLoading(false);
       });
 
     const handleOutsideClick = (event) => {
@@ -56,7 +67,7 @@ export default function Header() {
       isMounted = false;
       document.removeEventListener('mousedown', handleOutsideClick);
     };
-  }, []);
+  }, [searchReloadCount]);
 
   const isLoggedIn = !!user;
   const accountLabel = isAdmin
@@ -64,7 +75,8 @@ export default function Header() {
     : isVendor
       ? userProfile?.vendorProfile?.businessName || userProfile?.displayName || "VENDOR"
       : isLoggedIn ? "CUSTOMER" : "";
-  const cartCount = getCartCount();
+  const enquiriesPath = isVendor ? "/vendor/enquiries" : "/my-enquiries";
+  const enquiriesLabel = isVendor ? "Supplier enquiries" : "My enquiries";
   const searchResults = searchProducts.filter((product) => {
     const query = searchQuery.trim().toLowerCase();
     if (!query) return false;
@@ -98,7 +110,7 @@ export default function Header() {
       >
         <div className="scroll-progress-bar" style={{ width: `${scrollProgress}%` }} />
       </div>
-      <nav className="header-nav bg-[#020514] border-b border-orange-500/20 text-white px-6 py-4 flex items-center justify-between">
+      <nav className="header-nav bg-[#020514] border-b border-orange-500/20 text-white px-4 md:px-6 py-4 flex flex-wrap items-center justify-between">
       <div className="flex items-center space-x-8">
         <div className="header-brand-with-wheel" onPointerEnter={() => setShowPiston(true)} onFocusCapture={() => setShowPiston(true)}>
           <Link to="/" className="header-brand-lockup">
@@ -112,7 +124,7 @@ export default function Header() {
         <div className="hidden md:flex items-center space-x-6 text-sm font-medium text-slate-300">
           <Link to="/" className="hover:text-white transition-colors">Home</Link>
           <Link to="/products" className="hover:text-white transition-colors">Products</Link>
-          <Link to="/orders" className="hover:text-white transition-colors">Orders</Link>
+          {!isAdmin && <Link to={enquiriesPath} className="hover:text-white transition-colors">{enquiriesLabel}</Link>}
           {isVendor && <Link to="/vendor" className="hover:text-white transition-colors">Dashboard</Link>}
           {isAdmin && (
             <Link 
@@ -143,7 +155,14 @@ export default function Header() {
           </form>
           {isSearchOpen && searchQuery.trim() && (
             <div className="header-search-results">
-              {searchResults.length > 0 ? searchResults.map((product) => (
+              {searchProductsLoading ? (
+                <div className="header-search-empty" role="status">Loading parts...</div>
+              ) : searchProductsError ? (
+                <div className="header-search-empty" role="alert">
+                  Part search is unavailable.
+                  <button type="button" onClick={() => setSearchReloadCount((count) => count + 1)}>Try again</button>
+                </div>
+              ) : searchResults.length > 0 ? searchResults.map((product) => (
                 <Link
                   key={product.id}
                   to={`/products/${product.id}`}
@@ -163,19 +182,13 @@ export default function Header() {
                   <b>₹{product.price?.toLocaleString() || '—'}</b>
                 </Link>
               )) : (
-                <div className="header-search-empty">No matching parts found</div>
+                <div className="header-search-empty" role="status">No matching parts found</div>
               )}
             </div>
           )}
         </div>
 
-        {/* Cart Icon */}
-        <Link id="cart-icon" to="/cart" aria-label={`Cart with ${cartCount} items`} className="relative text-slate-400 hover:text-white transition-colors flex items-center justify-center">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5">
-            <path d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 0a2 2 0 11-4 0 2 2 0 014 0z"/>
-          </svg>
-          {cartCount > 0 && <span className="header-cart-count">{cartCount}</span>}
-        </Link>
+        <NotificationBell />
 
         {/* Profile Avatar / Login Toggle */}
         {isLoggedIn ? (
@@ -207,6 +220,23 @@ export default function Header() {
           </Link>
         )}
       </div>
+      <div className="md:hidden basis-full flex items-center gap-5 overflow-x-auto border-t border-slate-800 pt-3 text-sm font-medium text-slate-300">
+        <Link to="/" className="shrink-0 hover:text-white">Home</Link>
+        <Link to="/products" className="shrink-0 hover:text-white">Products</Link>
+        {!isAdmin && <Link to={enquiriesPath} className="shrink-0 hover:text-white">{enquiriesLabel}</Link>}
+        {isVendor && <Link to="/vendor" className="shrink-0 hover:text-white">Dashboard</Link>}
+        {isAdmin && <Link to="/admin" className="shrink-0 font-semibold text-orange-400">Admin</Link>}
+      </div>
+      <form className="md:hidden basis-full pt-3" onSubmit={handleSearchSubmit}>
+        <input
+          type="search"
+          placeholder="Search truck spare parts..."
+          value={searchQuery}
+          onChange={(event) => setSearchQuery(event.target.value)}
+          aria-label="Search truck spare parts"
+          className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-white focus:border-orange-500 focus:outline-none"
+        />
+      </form>
       </nav>
     </>
   );

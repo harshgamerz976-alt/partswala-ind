@@ -5,6 +5,9 @@ import { ArrowLeft, Loader2, Store } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/useAuth";
 import { auth, db } from "../firebase";
+import { getVerifiedVendorAccess } from "../services/vendorAccessService";
+import { recordLegalAcceptance } from "../services/legalAcceptanceService";
+import { LEGAL_POLICY_PATHS } from "../../shared/legalPolicies.js";
 
 const EMPTY_APPLICATION = {
   businessName: "",
@@ -27,7 +30,7 @@ function normalizeIndianPhone(value) {
 }
 
 export default function VendorLogin() {
-  const { currentUser, userProfile, isAdmin, loading: authLoading, login, logout } = useAuth();
+  const { currentUser, userProfile, isAdmin, isVendor, loading: authLoading, login, logout } = useAuth();
   const navigate = useNavigate();
   const [mode, setMode] = useState("login");
   const [application, setApplication] = useState(EMPTY_APPLICATION);
@@ -40,6 +43,8 @@ export default function VendorLogin() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
+  const [acceptedVendorPolicies, setAcceptedVendorPolicies] = useState(false);
+  const [marketingConsent, setMarketingConsent] = useState(false);
 
   useEffect(() => {
     if (!currentUser || authLoading) return;
@@ -47,14 +52,14 @@ export default function VendorLogin() {
       navigate("/admin", { replace: true });
       return;
     }
-    if (userProfile?.role === "vendor" && userProfile.vendorStatus === "approved") {
+    if (isVendor) {
       navigate("/vendor/dashboard", { replace: true });
       return;
     }
     getDoc(doc(db, "vendorApplications", currentUser.uid))
       .then((snapshot) => setVendorApplication(snapshot.exists() ? snapshot.data() : null))
       .catch(() => setError("Your vendor application status could not be loaded."));
-  }, [currentUser, authLoading, userProfile, isAdmin, navigate]);
+  }, [currentUser, authLoading, userProfile, isAdmin, isVendor, navigate]);
 
   function updateApplication(event) {
     setApplication((previous) => ({ ...previous, [event.target.name]: event.target.value }));
@@ -71,6 +76,10 @@ export default function VendorLogin() {
         navigate("/admin", { replace: true });
         return;
       }
+      if (await getVerifiedVendorAccess(signedInUser)) {
+        navigate("/vendor/dashboard", { replace: true });
+        return;
+      }
 
       const [profileSnapshot, vendorSnapshot] = await Promise.all([
         getDoc(doc(db, "users", signedInUser.uid)),
@@ -79,6 +88,8 @@ export default function VendorLogin() {
       const profile = profileSnapshot.exists() ? profileSnapshot.data() : {};
       if (profile.role === "vendor" && profile.vendorStatus === "approved") {
         navigate("/vendor/dashboard", { replace: true });
+      } else if (profile.role === "vendor") {
+        setVendorApplication({ status: profile.vendorStatus || "unavailable" });
       } else if (vendorSnapshot.exists()) {
         setVendorApplication(vendorSnapshot.data());
       } else {
@@ -93,6 +104,7 @@ export default function VendorLogin() {
 
   async function saveVendorApplication(user, phoneNumber) {
     await user.getIdToken(true);
+    await recordLegalAcceptance(user, "vendor", marketingConsent);
     const email = String(user.email || application.email).trim().toLowerCase();
     const applicationRef = doc(db, "vendorApplications", user.uid);
     const existing = await getDoc(applicationRef);
@@ -219,9 +231,15 @@ export default function VendorLogin() {
     }
   }
 
+  if (currentUser && !authLoading && userProfile?.role === "vendor" && userProfile.vendorStatus !== "approved" && !vendorAccessLoading) {
+    const status = String(userProfile.vendorStatus || "unavailable").toLowerCase();
+    return <main className="vendor-page"><section className="vendor-auth-shell"><Link to="/" className="vendor-back"><ArrowLeft size={15} /> Storefront</Link><div className="vendor-brand"><Store size={20} /><span>PARTSWALA VENDOR</span></div><p className="vendor-kicker">VENDOR ACCESS</p><h1>Vendor access is unavailable.</h1><p className="vendor-status-copy">Status: <strong>{status}</strong></p><button className="vendor-secondary" type="button" onClick={logout}>Sign out</button></section></main>;
+  }
+
   if (currentUser && !authLoading && vendorApplication) {
-    const rejected = vendorApplication.status === "rejected";
-    return <main className="vendor-page"><section className="vendor-auth-shell"><Link to="/" className="vendor-back"><ArrowLeft size={15} /> Storefront</Link><div className="vendor-brand"><Store size={20} /><span>PARTSWALA VENDOR</span></div><p className="vendor-kicker">APPLICATION STATUS</p><h1>{rejected ? "Application needs changes." : "Application under review."}</h1><p className="vendor-status-copy">Status: <strong>{rejected ? "Rejected" : "Pending review"}</strong></p>{vendorApplication.rejectionReason && <div className="vendor-rejection"><strong>Reason</strong><p>{vendorApplication.rejectionReason}</p></div>}<button className="vendor-secondary" type="button" onClick={logout}>Sign out</button></section></main>;
+    const status = String(vendorApplication.status || "pending").toLowerCase();
+    const rejected = status === "rejected";
+    return <main className="vendor-page"><section className="vendor-auth-shell"><Link to="/" className="vendor-back"><ArrowLeft size={15} /> Storefront</Link><div className="vendor-brand"><Store size={20} /><span>PARTSWALA VENDOR</span></div><p className="vendor-kicker">APPLICATION STATUS</p><h1>{rejected ? "Application needs changes." : status === "pending" ? "Application under review." : "Vendor access is unavailable."}</h1><p className="vendor-status-copy">Status: <strong>{status}</strong></p>{vendorApplication.rejectionReason && <div className="vendor-rejection"><strong>Reason</strong><p>{vendorApplication.rejectionReason}</p></div>}<button className="vendor-secondary" type="button" onClick={logout}>Sign out</button></section></main>;
   }
 
   return <main className="vendor-page"><section className="vendor-auth-shell">
@@ -248,6 +266,14 @@ export default function VendorLogin() {
       <label>PIN code<input required inputMode="numeric" pattern="[0-9]{6}" maxLength="6" name="pincode" value={application.pincode} onChange={updateApplication} /></label>
       <label>GSTIN <span>Optional</span><input name="gstin" value={application.gstin} onChange={updateApplication} /></label>
       <label>PAN <span>Optional</span><input name="pan" value={application.pan} onChange={updateApplication} /></label>
+      <label className="legal-consent-option">
+        <input type="checkbox" required checked={acceptedVendorPolicies} onChange={(event) => setAcceptedVendorPolicies(event.target.checked)} />
+        <span>I have read and agree to the <Link to={LEGAL_POLICY_PATHS.privacy}>Privacy Policy</Link>, <Link to={LEGAL_POLICY_PATHS.terms}>General Terms &amp; Conditions</Link>, and <Link to={LEGAL_POLICY_PATHS.vendorTerms}>Vendor Terms &amp; Conditions</Link>.</span>
+      </label>
+      <label className="legal-consent-option">
+        <input type="checkbox" checked={marketingConsent} onChange={(event) => setMarketingConsent(event.target.checked)} />
+        <span>Optional: I would like to receive marketing communications. This choice is separate and is not required to apply.</span>
+      </label>
       {info && <p className="vendor-success" role="status">{info}</p>}
       <button className="vendor-primary" disabled={loading || Boolean(phoneConfirmation && verificationCode.length < 6)}>{loading ? <Loader2 size={16} /> : null}{phoneConfirmation ? "Verify phone & submit" : "Verify phone number"}</button>
     </form>}

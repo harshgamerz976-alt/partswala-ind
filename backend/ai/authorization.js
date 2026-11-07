@@ -1,7 +1,7 @@
 const TOOL_PERMISSIONS = {
-  customer: new Set(["answer", "getStoreInfo", "searchProducts", "getProduct", "compareProducts", "checkCompatibility", "getOrders", "getShippingEstimate", "getCart", "addToCart", "removeFromCart"]),
-  vendor: new Set(["answer", "getStoreInfo", "searchProducts", "getProduct", "compareProducts", "checkCompatibility", "getOrders", "getShippingEstimate", "getCart", "addToCart", "removeFromCart", "getVendorSales", "getVendorPayout", "getLowStockProducts"]),
-  admin: new Set(["answer", "getStoreInfo", "searchProducts", "getProduct", "compareProducts", "checkCompatibility", "getOrders", "getShippingEstimate", "getCart", "addToCart", "removeFromCart", "getVendorSales", "getVendorPayout", "getLowStockProducts", "getAdminFinance"]),
+  customer: new Set(["answer", "getStoreInfo", "searchProducts", "getProduct", "compareProducts", "checkCompatibility", "getOrders"]),
+  vendor: new Set(["answer", "getStoreInfo", "searchProducts", "getProduct", "compareProducts", "checkCompatibility", "getOrders", "getVendorSales", "getVendorPayout", "getLowStockProducts"]),
+  admin: new Set(["answer", "getStoreInfo", "searchProducts", "getProduct", "compareProducts", "checkCompatibility", "getOrders", "getVendorSales", "getVendorPayout", "getLowStockProducts", "getAdminFinance"]),
 };
 
 export function assistantRoleFor({ user, profile, isAdmin = false }) {

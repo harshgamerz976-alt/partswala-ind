@@ -1,32 +1,9 @@
-import { useCart } from "../context/useCart";
-import { useAuth } from "../context/useAuth";
 import { Link } from "react-router-dom";
-
-// Tick sound generator
-function playTickSound() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (ctx.state === "suspended") ctx.resume();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value = 1200;
-    osc.type = "sine";
-    gain.gain.setValueAtTime(0.5, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.1);
-  } catch {}
-}
+import { getKnownProductStock, getProductTaxLabel } from "../services/productPresentation";
 
 export default function ProductCard({ product, onCompare, isCompared = false }) {
-  const { cart, addToCart } = useCart();
-  const auth = useAuth();
-  const showToast = auth?.showToast;
-
-  const isOutOfStock = product.stock === 0 || product.stockCount === 0;
-  const badgeText = product.badge || (product.tags?.includes("bestseller") ? "BEST SELLER" : "POPULAR");
+  const isOutOfStock = getKnownProductStock(product) === 0;
+  const badgeText = product.badge || (product.tags?.includes("bestseller") ? "BEST SELLER" : "");
   const isBestSeller = badgeText === "BEST SELLER";
   const sellingPrice = Number(product.price);
   const mrp = Number(product.mrp);
@@ -44,55 +21,6 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
   function resetTilt(event) {
     event.currentTarget.style.setProperty("--card-rotate-x", "0deg");
     event.currentTarget.style.setProperty("--card-rotate-y", "0deg");
-  }
-
-  function handleAddToCart(e) {
-    e.preventDefault();
-    e.stopPropagation();
-
-    if (isOutOfStock) return;
-
-    const existingItem = cart?.find((item) => item.id === product.id);
-    let message = `${product.name || product.title} added to cart!`;
-    if (existingItem) {
-      message = `${product.name || product.title} added to cart (x${existingItem.quantity + 1})`;
-    }
-
-    playTickSound();
-    addToCart(product);
-
-    if (showToast) {
-      showToast(message, "success");
-    }
-
-    // Flying cart animation
-    const isMobile = window.innerWidth < 768;
-    const cartIcon = document.getElementById(isMobile ? "cart-icon-mobile" : "cart-icon");
-
-    if (cartIcon) {
-      const cartRect = cartIcon.getBoundingClientRect();
-      const flyEl = document.createElement("div");
-      flyEl.innerText = "🛒";
-      flyEl.style.position = "fixed";
-      flyEl.style.zIndex = "9999";
-      flyEl.style.pointerEvents = "none";
-      flyEl.style.transition = "all 0.8s cubic-bezier(0.19, 1, 0.22, 1)";
-      flyEl.style.left = `${e.clientX}px`;
-      flyEl.style.top = `${e.clientY}px`;
-      document.body.appendChild(flyEl);
-
-      requestAnimationFrame(() => {
-        flyEl.style.left = `${cartRect.left + cartRect.width / 2}px`;
-        flyEl.style.top = `${cartRect.top + cartRect.height / 2}px`;
-        flyEl.style.transform = "scale(0.2) rotate(360deg)";
-        flyEl.style.opacity = "0";
-      });
-
-      setTimeout(() => {
-        flyEl.remove();
-        window.dispatchEvent(new Event("cart-pop"));
-      }, 850);
-    }
   }
 
   return (
@@ -160,11 +88,12 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
         <div className="product-card-body p-5 flex flex-col flex-1 justify-between gap-5">
           <div>
             <h3 className="product-card-title text-xl font-extrabold text-white group-hover:text-orange-400 transition-colors tracking-tight">
-              {product.name || product.title || "Clutch Plate"}
+              {product.name || product.title || "Unnamed part"}
             </h3>
             <p className="product-card-part-number text-xs font-mono font-medium text-slate-400 mt-1">
-              {product.partNumber || product.category || "CP-1234"}
+              {product.partNumber || "Part number not listed"}
             </p>
+            <p className="text-xs text-slate-500 mt-1">{product.vendorBusinessName || (product.sellerType === "vendor" ? "Approved vendor" : "PARTSWALA IND")}</p>
             {onCompare && (
               <button
                 type="button"
@@ -185,27 +114,27 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
               <div className="flex flex-col items-center">
                 <div className="flex items-center justify-center gap-1 text-orange-400 text-xs font-bold">
                   <span className="product-card-benefit-icon">◇</span>
-                  <span className="text-white text-[10px] font-semibold">Premium</span>
+                  <span className="text-white text-[10px] font-semibold">Supplier quote</span>
                 </div>
-                <span className="text-[9px] text-slate-400 mt-0.5 whitespace-nowrap">Durable & Reliable</span>
+                <span className="text-[9px] text-slate-400 mt-0.5 whitespace-nowrap">Request pricing</span>
               </div>
 
               {/* Feature 2 */}
               <div className="flex flex-col items-center border-x border-slate-800/80 px-1">
                 <div className="flex items-center justify-center gap-1 text-orange-400 text-xs font-bold">
                   <span className="product-card-benefit-icon">⚙</span>
-                  <span className="text-white text-[10px] font-semibold">Perfect Fit</span>
+                  <span className="text-white text-[10px] font-semibold">Fitment</span>
                 </div>
-                <span className="text-[9px] text-slate-400 mt-0.5 whitespace-nowrap">Truck Compatible</span>
+                <span className="text-[9px] text-slate-400 mt-0.5 whitespace-nowrap">Confirm compatibility</span>
               </div>
 
               {/* Feature 3 */}
               <div className="flex flex-col items-center">
                 <div className="flex items-center justify-center gap-1 text-orange-400 text-xs font-bold">
                   <span className="product-card-benefit-icon">◇</span>
-                  <span className="text-white text-[10px] font-semibold">Long Lasting</span>
+                  <span className="text-white text-[10px] font-semibold">Availability</span>
                 </div>
-                <span className="text-[9px] text-slate-400 mt-0.5 whitespace-nowrap">High Performance</span>
+                <span className="text-[9px] text-slate-400 mt-0.5 whitespace-nowrap">Ask supplier</span>
               </div>
             </div>
           </div>
@@ -217,22 +146,11 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
               <span className="product-card-price text-2xl font-black text-orange-500 font-mono tracking-tight block">{validSellingPrice == null ? "—" : `₹${validSellingPrice.toLocaleString("en-IN")}`}</span>
               {discountAmount > 0 && <span className="product-card-savings block text-[10px] font-semibold text-emerald-400">You save ₹{discountAmount.toLocaleString("en-IN")}</span>}
               <span className="text-[10px] text-slate-400 block font-medium">
-                {product.priceIncludesGst === false ? "Before applicable GST" : "Incl. of all taxes"}
+                {getProductTaxLabel(product.priceIncludesGst)}
               </span>
             </div>
 
-            <button
-              onClick={handleAddToCart}
-              disabled={isOutOfStock}
-              className={`product-card-cart px-4 py-2.5 rounded-xl font-bold text-xs transition-all duration-200 flex items-center gap-1.5 shadow-lg active:scale-95 ${
-                isOutOfStock
-                  ? "bg-slate-800 text-slate-500 cursor-not-allowed"
-                  : "bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white shadow-orange-500/25"
-              }`}
-            >
-              <span className="product-card-cart-icon">▱</span>
-              <span>{isOutOfStock ? "Unavailable" : "Add to Cart"}</span>
-            </button>
+            <span className="text-xs font-bold text-orange-400">View details &amp; ask supplier</span>
           </div>
         </div>
       </div>

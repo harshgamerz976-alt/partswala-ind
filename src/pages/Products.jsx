@@ -1,12 +1,19 @@
 import { useState, useEffect } from "react";
+import { useLocation } from "react-router-dom";
 import { getProductsPage } from "../services/productService";
+import { getProductSearchFromUrl } from "../services/productSearch";
+import { getKnownProductStock } from "../services/productPresentation";
 import ProductCard from "../components/productcard";
 
 export default function Products() {
+  const location = useLocation();
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
+  const [reloadCount, setReloadCount] = useState(0);
   const [selectedCategory, setSelectedCategory] = useState("All");
-  const [searchQuery, setSearchQuery] = useState("");
+  const [searchQuery, setSearchQuery] = useState(() => getProductSearchFromUrl(location.search));
   const [compareItems, setCompareItems] = useState([]);
   const [isCompareOpen, setIsCompareOpen] = useState(false);
   const [compareMessage, setCompareMessage] = useState("");
@@ -17,6 +24,7 @@ export default function Products() {
   async function loadMoreProducts() {
     if (!productsCursor || !hasMoreProducts || loadingMore) return;
     setLoadingMore(true);
+    setLoadMoreError(false);
     try {
       const page = await getProductsPage(productsCursor);
       setProducts((previous) => [...previous, ...page.products]);
@@ -24,6 +32,7 @@ export default function Products() {
       setHasMoreProducts(page.hasMore);
     } catch (err) {
       console.error("More catalogue products could not be loaded:", err);
+      setLoadMoreError(true);
     } finally {
       setLoadingMore(false);
     }
@@ -31,6 +40,8 @@ export default function Products() {
 
   async function loadInitialProducts() {
     setLoading(true);
+    setLoadError(false);
+    setProducts([]);
     try {
       const page = await getProductsPage();
       setProducts(page.products);
@@ -38,6 +49,7 @@ export default function Products() {
       setHasMoreProducts(page.hasMore);
     } catch (err) {
       console.error("Error fetching products for storefront:", err);
+      setLoadError(true);
     } finally {
       setLoading(false);
     }
@@ -45,7 +57,11 @@ export default function Products() {
 
   useEffect(() => {
     loadInitialProducts();
-  }, []);
+  }, [reloadCount]);
+
+  useEffect(() => {
+    setSearchQuery(getProductSearchFromUrl(location.search));
+  }, [location.search]);
 
   // 1. Dynamic category generation to ensure strict string matches
   const categories = ["All", ...new Set(products.map((p) => p.category).filter(Boolean))];
@@ -95,7 +111,7 @@ export default function Products() {
         <div>
           <p className="featured-eyebrow">THE COMPLETE DEPOT / 03</p>
           <h1 className="text-3xl font-black tracking-wide text-white">Truck parts catalogue</h1>
-          <p className="text-slate-400 text-sm">Browse genuine commercial vehicle spares and OEM replacements.</p>
+          <p className="text-slate-400 text-sm">Browse commercial vehicle spares from PARTSWALA IND and approved vendors.</p>
         </div>
         <div className="products-total"><strong>{filteredProducts.length}</strong><span>parts shown</span></div>
       </div>
@@ -133,7 +149,18 @@ export default function Products() {
       </div>
 
       {/* Grid Display Area */}
-      {filteredProducts.length === 0 ? (
+      {loadError ? (
+        <div className="text-center py-20 bg-slate-900 rounded-2xl border border-slate-800/60" role="alert">
+          <h3 className="text-lg font-bold text-slate-300">Product listings could not be loaded.</h3>
+          <p className="text-slate-500 text-sm mt-1">Check your connection and try again.</p>
+          <button type="button" onClick={() => setReloadCount((count) => count + 1)} className="products-reset products-reset-empty">Try again</button>
+        </div>
+      ) : products.length === 0 ? (
+        <div className="text-center py-20 bg-slate-900 rounded-2xl border border-slate-800/60" role="status">
+          <span className="text-4xl">📦</span>
+          <h3 className="text-lg font-bold text-slate-300 mt-4">No products are available right now.</h3>
+        </div>
+      ) : filteredProducts.length === 0 ? (
         <div className="text-center py-20 bg-slate-900 rounded-2xl border border-slate-800/60">
           <span className="text-4xl">📦</span>
           <h3 className="text-lg font-bold text-slate-300 mt-4">No matching truck parts found</h3>
@@ -149,6 +176,7 @@ export default function Products() {
       )}
 
       {hasMoreProducts && <div className="flex justify-center py-8"><button type="button" onClick={loadMoreProducts} disabled={loadingMore} className="products-reset">{loadingMore ? "Loading parts..." : "Load more parts"}</button></div>}
+      {loadMoreError && <div className="flex justify-center gap-3 py-4" role="alert"><span>More parts could not be loaded.</span><button type="button" onClick={loadMoreProducts} disabled={loadingMore} className="products-reset">{loadingMore ? "Loading parts..." : "Try again"}</button></div>}
 
       {compareItems.length > 0 && (
         <div className="compare-tray">
@@ -166,7 +194,10 @@ export default function Products() {
             <header><div><p className="featured-eyebrow">PART MATCH / 01</p><h2>Compare selected parts</h2></div><button type="button" onClick={() => setIsCompareOpen(false)} aria-label="Close comparison">×</button></header>
             <div className="compare-table">
               <div className="compare-label-column"><span>Part</span><span>Brand</span><span>Category</span><span>Part number</span><span>Selling price</span><span>MRP</span><span>Stock</span></div>
-              {compareItems.map((item) => <div className="compare-product-column" key={item.id}><strong>{item.name || item.title}</strong><span>{item.brand || "Generic"}</span><span>{item.category || "Other"}</span><span>{item.partNumber || "Not listed"}</span><b>{money(item.price)}</b><span>{item.mrp ? money(item.mrp) : "Not listed"}</span><span className={Number(item.stock || 0) > 0 ? "compare-in-stock" : "compare-out-stock"}>{Number(item.stock || 0) > 0 ? `${item.stock} available` : "Out of stock"}</span><button type="button" onClick={() => toggleCompare(item)}>Remove</button></div>)}
+              {compareItems.map((item) => {
+                const stock = getKnownProductStock(item);
+                return <div className="compare-product-column" key={item.id}><strong>{item.name || item.title}</strong><span>{item.brand || "Generic"}</span><span>{item.category || "Other"}</span><span>{item.partNumber || "Not listed"}</span><b>{money(item.price)}</b><span>{item.mrp ? money(item.mrp) : "Not listed"}</span><span className={stock === null ? "" : stock > 0 ? "compare-in-stock" : "compare-out-stock"}>{stock === null ? "Ask supplier" : stock > 0 ? `${stock} listed` : "Unavailable"}</span><button type="button" onClick={() => toggleCompare(item)}>Remove</button></div>;
+              })}
             </div>
           </section>
         </div>

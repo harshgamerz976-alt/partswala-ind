@@ -1,5 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
+import LegalPolicyLinks from './LegalPolicyLinks';
 
 export default function Footer() {
   const currentYear = new Date().getFullYear();
@@ -19,7 +20,7 @@ export default function Footer() {
         <div className="site-footer-columns">
           <div className="site-footer-brand">
             <Link to="/" className="site-footer-logo"><span>♥</span> PARTSWALA</Link>
-            <p>India's modern destination for genuine commercial truck spare parts.</p>
+            <p>Find commercial vehicle parts and request a supplier quote.</p>
           </div>
 
           <div>
@@ -27,17 +28,17 @@ export default function Footer() {
             <ul>
               <li><Link to="/">Our Story</Link></li>
               <li><Link to="/products">Our Products</Link></li>
-              <li><Link to="/orders">Delivery Network</Link></li>
-              <li><Link to="/profile">Careers</Link></li>
+              <li><Link to="/legal/enquiries">Supplier enquiries</Link></li>
+              <li><a href="mailto:support@partswalaind.com?subject=Careers%20at%20PARTSWALA%20IND">Careers</a></li>
             </ul>
           </div>
 
           <div>
             <h4>Helpful Links</h4>
             <ul>
-              <li><Link to="/products">FAQs</Link></li>
-              <li><Link to="/profile">Support</Link></li>
-              <li><Link to="/orders">Track Order <span className="footer-live-dot" /></Link></li>
+              <li><Link to="/legal/enquiries">Enquiry &amp; quotation policy</Link></li>
+              <li><a href="mailto:support@partswalaind.com">Support</a></li>
+              <li><Link to="/my-enquiries">My supplier enquiries</Link></li>
             </ul>
           </div>
 
@@ -46,9 +47,14 @@ export default function Footer() {
             <ul className="site-footer-contact">
               <li><span className="footer-icon">✉</span><a href="mailto:support@partswalaind.com">support@partswalaind.com</a></li>
               <li><span className="footer-icon">⌕</span><a href="tel:+918637373116">+91 86373 73116</a></li>
-              <li><span className="footer-icon">⌖</span><span>Pan-India delivery</span></li>
+              <li><span className="footer-icon">⌖</span><span>B2B automotive parts marketplace</span></li>
             </ul>
           </div>
+        </div>
+
+        <div className="site-footer-legal">
+          <h4>Legal &amp; Policies</h4>
+          <LegalPolicyLinks />
         </div>
 
         <div

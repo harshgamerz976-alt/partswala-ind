@@ -11,7 +11,11 @@ test("financial, administrative, account, and personal-data routes check revocat
     "/api/phonepe/orders",
     "/api/shiprocket/orders",
     "/api/vendor/finance",
+    "/api/vendor/access",
+    "/api/vendor/product-images",
+    "/api/uploads/cloudinary",
     "/api/enquiries",
+    "/api/legal/acceptance",
     "/api/vendor/enquiries",
     "/api/vendor/enquiries/enquiry-1/quote",
     "/api/phone/verification",
@@ -24,8 +28,10 @@ test("token verification forwards the sensitive-route revocation policy to Fireb
   const calls = [];
   const auth = { verifyIdToken: async (...args) => { calls.push(args); return { uid: "user-1" }; } };
   await verifyFirebaseIdToken(auth, "signed-token", "/api/admin/finance");
+  await verifyFirebaseIdToken(auth, "signed-token", "/api/vendor/product-images");
+  await verifyFirebaseIdToken(auth, "signed-token", "/api/uploads/cloudinary");
   await verifyFirebaseIdToken(auth, "signed-token", "/api/catalog");
-  assert.deepEqual(calls, [["signed-token", true], ["signed-token", false]]);
+  assert.deepEqual(calls, [["signed-token", true], ["signed-token", true], ["signed-token", true], ["signed-token", false]]);
 });
 
 test("Firebase token diagnostics expose safe metadata without returning token contents", () => {
