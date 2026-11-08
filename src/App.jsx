@@ -30,6 +30,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'));
 const VendorLogin = lazy(() => import('./pages/VendorLogin'));
 const SellParts = lazy(() => import('./pages/SellParts'));
 const BulkUpload = lazy(() => import('./pages/BulkUpload'));
+const SupplierEnquiries = lazy(() => import('./pages/SupplierEnquiries'));
 
 export default function App() {
   const { currentUser, isAdmin, loading: authLoading } = useAuth();
@@ -116,6 +117,7 @@ export default function App() {
             <Route path="/product/:id" element={<ProductDetail />} />
 
             <Route path="/profile" element={<Profile />} />
+            <Route path="/my-enquiries" element={<SupplierEnquiries />} />
             <Route path="/cart" element={<Cart />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/login" element={<Login />} />
@@ -129,6 +131,7 @@ export default function App() {
             <Route path="/vendor/login" element={<VendorLogin />} />
             <Route path="/vendor" element={<VendorRoute><SellParts /></VendorRoute>} />
             <Route path="/vendor/dashboard" element={<VendorRoute><SellParts /></VendorRoute>} />
+            <Route path="/vendor/enquiries" element={<VendorRoute><SupplierEnquiries vendorMode /></VendorRoute>} />
             <Route path="/vendor/import" element={<VendorRoute><BulkUpload /></VendorRoute>} />
 
             <Route

@@ -1,4 +1,6 @@
 import { useCart } from "../context/useCart";
+import { useState } from "react";
+import SupplierEnquiryDialog from "./SupplierEnquiryDialog";
 import { useAuth } from "../context/useAuth";
 import { Link } from "react-router-dom";
 
@@ -24,6 +26,8 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
   const { cart, addToCart } = useCart();
   const auth = useAuth();
   const showToast = auth?.showToast;
+  const [enquiryOpen, setEnquiryOpen] = useState(false);
+  const isVendorListing = String(product.sellerType || "").toLowerCase() === "vendor";
 
   const isOutOfStock = product.stock === 0 || product.stockCount === 0;
   const badgeText = product.badge || (product.tags?.includes("bestseller") ? "BEST SELLER" : "POPULAR");
@@ -221,6 +225,9 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
               </span>
             </div>
 
+            {isVendorListing ? (
+              <button type="button" className="product-card-cart px-4 py-2.5 rounded-xl font-bold text-xs" onClick={(event) => { event.preventDefault(); event.stopPropagation(); setEnquiryOpen(true); }}>Contact Supplier</button>
+            ) : (
             <button
               onClick={handleAddToCart}
               disabled={isOutOfStock}
@@ -233,9 +240,11 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
               <span className="product-card-cart-icon">▱</span>
               <span>{isOutOfStock ? "Unavailable" : "Add to Cart"}</span>
             </button>
+            )}
           </div>
         </div>
       </div>
+      {isVendorListing && <SupplierEnquiryDialog product={product} businessName={product.vendorBusinessName || product.vendorName || product.soldBy || ""} open={enquiryOpen} onClose={() => setEnquiryOpen(false)} />}
     </Link>
   );
 }

@@ -1,0 +1,39 @@
+.supplier-enquiry-dialog {
+  background: #0b1322;
+  border: 1px solid rgba(249, 115, 22, .4);
+  border-radius: 12px;
+  color: #f8fafc;
+  max-height: min(90vh, 720px);
+  max-width: min(92vw, 540px);
+  overflow: auto;
+  padding: 0;
+  width: 100%;
+}
+.supplier-enquiry-dialog::backdrop { background: rgba(2, 5, 20, .78); backdrop-filter: blur(5px); }
+.supplier-enquiry-content { padding: 28px; position: relative; }
+.supplier-enquiry-close { align-items: center; background: transparent; border: 1px solid #334155; border-radius: 50%; color: #cbd5e1; display: flex; font-size: 22px; height: 34px; justify-content: center; position: absolute; right: 16px; top: 16px; width: 34px; }
+.supplier-enquiry-kicker { color: #fb923c; font-size: 10px; font-weight: 800; letter-spacing: .14em; }
+.supplier-enquiry-content h2 { font-size: 23px; font-weight: 750; line-height: 1.25; margin: 8px 38px 0 0; overflow-wrap: anywhere; }
+.supplier-enquiry-product { color: #cbd5e1; font-size: 13px; margin: 10px 0 0; }
+.supplier-enquiry-price { color: #cbd5e1; font-size: 13px; margin: 8px 0 0; }
+.supplier-enquiry-seller { border-bottom: 1px solid #334155; color: #94a3b8; display: grid; font-size: 12px; gap: 5px; margin: 14px 0 18px; padding-bottom: 15px; }
+.supplier-enquiry-seller strong { color: #fdba74; }
+.supplier-enquiry-seller span { color: #94a3b8; font-size: 11px; }
+.supplier-enquiry-content form { display: grid; gap: 14px; }
+.supplier-enquiry-content form > label:not(.supplier-enquiry-consent) { color: #cbd5e1; display: grid; font-size: 12px; font-weight: 650; gap: 7px; }
+.supplier-enquiry-content input[type="number"], .supplier-enquiry-content textarea { background: #060d19; border: 1px solid #334155; border-radius: 6px; color: #f8fafc; font: inherit; padding: 10px 11px; width: 100%; }
+.supplier-enquiry-content textarea { line-height: 1.55; resize: vertical; }
+.supplier-enquiry-consent { align-items: flex-start; color: #cbd5e1; display: flex; font-size: 11px; gap: 9px; line-height: 1.5; }
+.supplier-enquiry-consent input { accent-color: #f97316; flex: 0 0 auto; margin-top: 2px; }
+.supplier-enquiry-submit, .supplier-enquiry-signin button, .supplier-enquiry-actions a, .supplier-enquiry-actions button { align-items: center; background: #f97316; border: 0; border-radius: 6px; color: #160b04; display: inline-flex; font-size: 12px; font-weight: 800; justify-content: center; min-height: 42px; padding: 0 14px; text-decoration: none; }
+.supplier-enquiry-submit:disabled { cursor: wait; opacity: .7; }
+.supplier-enquiry-error { color: #fca5a5; font-size: 12px; margin: 0; }
+.supplier-enquiry-signin { display: grid; gap: 12px; }
+.supplier-enquiry-signin p, .supplier-enquiry-success p { color: #cbd5e1; font-size: 13px; line-height: 1.6; }
+.supplier-enquiry-success h2 { margin-top: 10px; }
+.supplier-enquiry-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+.supplier-enquiry-actions button { background: #1e293b; color: #e2e8f0; }
+@media (max-width: 520px) {
+  .supplier-enquiry-content { padding: 24px 19px; }
+  .supplier-enquiry-content h2 { font-size: 20px; }
+}

@@ -6,6 +6,7 @@ import express from "express";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
+import { getMessaging } from "firebase-admin/messaging";
 import { calculateOrderPricing } from "./pricing.js";
 import { customerFacingPricing } from "./customerPricing.js";
 import { getShiprocketShippingQuote } from "./shipping.js";
@@ -27,10 +28,25 @@ import { assistantRateLimitDecision, createAssistantLimiters, resolveClientIp } 
 import { resolveLegacySellerOwnership } from "./sellerOwnership.js";
 import { normalizeReturnWindowDays, isReturnWindowOpen } from "../src/services/returnPolicy.js";
 import { isDeliveredPurchaseFor, publicReview, validateReviewInput } from "./reviews.js";
-import { isEligibleVendorEnquiryProduct, isValidSupplierDocumentId } from "./vendorEnquiries.js";
+import {
+  canCreateSupplierEnquiry,
+  canQuoteSupplierEnquiry,
+  isEligibleVendorEnquiryProduct,
+  isValidSupplierDocumentId,
+  serializeSupplierEnquiry,
+  validateSupplierEnquiryInput,
+  validateSupplierQuoteInput,
+} from "./vendorEnquiries.js";
 import { redactAuditValue } from "./audit.js";
 import { firebaseIdTokenDiagnostics, verifyFirebaseIdToken } from "./authentication.js";
 import { hasAdminClaim } from "./adminAuthorization.js";
+import {
+  fcmTokenDocumentId,
+  persistSupplierNotification,
+  supplierNotificationId,
+  supplierNotification,
+  validateFcmToken,
+} from "./notifications.js";
 import { adminLifecycleOverrideProblem } from "./adminLifecycle.js";
 import { normalizeFinanceDateRange } from "./financeDateRange.js";
 import { normalizeIndianState, resolveSellerTaxState, validatedDeliveryState } from "./sellerTaxContext.js";
@@ -56,6 +72,8 @@ console.info("[Cloudinary] startup configuration:", cloudinaryCredentialPresence
 const reviewLimiter = createRateLimiter({ limit: 5, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
 const reviewReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const publicProductContactLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
+const supplierEnquiryLimiter = createRateLimiter({ limit: 10, windowMs: 60 * 60 * 1000, maxKeys: 20000 });
+const supplierEnquiryReadLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 20000 });
 const publicProductSellerNameLimiter = createRateLimiter({ limit: 60, windowMs: 60 * 1000, maxKeys: 10000 });
 const bulkImportUpload = multer({
   storage: multer.memoryStorage(),
@@ -126,6 +144,30 @@ function requireEnv(names) {
 
 function getDb() {
   return getFirestore(getFirebaseApp());
+}
+
+function notificationPushEnabled() {
+  return process.env.FCM_PUSH_ENABLED === "true"
+    && process.env.NODE_ENV !== "test"
+    && !process.env.FIRESTORE_EMULATOR_HOST
+    && !process.env.FIREBASE_AUTH_EMULATOR_HOST;
+}
+
+async function recordSupplierNotification(database, recipientId, notification) {
+  if (!recipientId) return;
+  try {
+    const result = await persistSupplierNotification({
+      database,
+      messaging: notificationPushEnabled() ? () => getMessaging(getFirebaseApp()) : null,
+      recipientId,
+      notification,
+    });
+    if (result.failed.length) {
+      console.warn("Supplier push delivery failed for notification devices.", result.failed.length);
+    }
+  } catch (error) {
+    console.warn("Supplier notification could not be recorded.", error?.code || "firestore_error");
+  }
 }
 
 function getFirebaseApp() {
@@ -316,6 +358,17 @@ async function releaseInventoryReservation(transaction, db, order, timestamp) {
 
 function isAdminUser(user) {
   return hasAdminClaim(user);
+}
+
+async function canUseUserNotifications(database, user) {
+  if (isAdminUser(user)) return false;
+  const snapshot = await database.collection("users").doc(user.uid).get();
+  return snapshot.exists && canCreateSupplierEnquiry(snapshot.data(), false);
+}
+
+function idempotencyRequestRef(database, collectionName, userId, requestId) {
+  const id = createHash("sha256").update(userId).update("\0").update(requestId).digest("hex");
+  return database.collection(collectionName).doc(id);
 }
 
 function stageAdminAudit(transaction, db, user, { action, entityType, entityId, oldValue = null, newValue = null, reason = "", timestamp = new Date().toISOString() }) {
@@ -846,6 +899,403 @@ app.post("/api/reviews", async (request, response) => {
  * must match the `phone_number` claim on the caller's Firebase ID token, which only Firebase
  * Phone Auth can set.
  */
+app.post("/api/notifications/fcm-token", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const database = getDb();
+    if (!await canUseUserNotifications(database, user)) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    const token = validateFcmToken(request.body?.token);
+    const tokenId = fcmTokenDocumentId(token);
+    const ownerRef = database.collection("fcmTokenOwners").doc(tokenId);
+    const tokenRef = database.collection("users").doc(user.uid).collection("fcmTokens").doc(tokenId);
+    const now = new Date().toISOString();
+    await database.runTransaction(async (transaction) => {
+      const ownerSnapshot = await transaction.get(ownerRef);
+      const previousOwnerId = ownerSnapshot.exists ? ownerSnapshot.data()?.userId : "";
+      if (previousOwnerId && previousOwnerId !== user.uid) {
+        transaction.delete(database.collection("users").doc(previousOwnerId).collection("fcmTokens").doc(tokenId));
+      }
+      transaction.set(ownerRef, { userId: user.uid, updatedAt: now });
+      transaction.set(tokenRef, { token, createdAt: now, updatedAt: now });
+    });
+    return response.json({ registered: true });
+  } catch (error) {
+    if (error.message === "A valid notification token is required.") {
+      return response.status(400).json({ message: error.message });
+    }
+    console.error("Notification token could not be registered.", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Notifications could not be enabled." });
+  }
+});
+
+app.delete("/api/notifications/fcm-token", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const database = getDb();
+    if (!await canUseUserNotifications(database, user)) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    const tokenId = fcmTokenDocumentId(validateFcmToken(request.body?.token));
+    const ownerRef = database.collection("fcmTokenOwners").doc(tokenId);
+    const tokenRef = database.collection("users").doc(user.uid).collection("fcmTokens").doc(tokenId);
+    await database.runTransaction(async (transaction) => {
+      const ownerSnapshot = await transaction.get(ownerRef);
+      if (ownerSnapshot.exists && ownerSnapshot.data()?.userId === user.uid) {
+        transaction.delete(ownerRef);
+        transaction.delete(tokenRef);
+      }
+    });
+    return response.json({ removed: true });
+  } catch (error) {
+    if (error.message === "A valid notification token is required.") {
+      return response.status(400).json({ message: error.message });
+    }
+    console.error("Notification token could not be removed.", error?.code || "firestore_error");
+    return response.status(500).json({ message: "The notification device could not be removed." });
+  }
+});
+
+app.patch("/api/notifications/read-all", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const database = getDb();
+    if (!await canUseUserNotifications(database, user)) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    const collection = database.collection("users").doc(user.uid).collection("notifications");
+    let updated = 0;
+    while (true) {
+      const snapshot = await collection.where("read", "==", false).limit(400).get();
+      if (snapshot.empty) break;
+      const batch = database.batch();
+      const readAt = new Date().toISOString();
+      snapshot.docs.forEach((document) => batch.update(document.ref, { read: true, readAt }));
+      await batch.commit();
+      updated += snapshot.size;
+    }
+    return response.json({ updated });
+  } catch (error) {
+    console.error("Notifications could not be marked as read.", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Notifications could not be marked as read." });
+  }
+});
+
+app.patch("/api/notifications/:notificationId/read", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const notificationId = String(request.params.notificationId || "").trim();
+  if (!isValidSupplierDocumentId(notificationId)) {
+    return response.status(400).json({ message: "A valid notification ID is required." });
+  }
+  try {
+    const database = getDb();
+    if (!await canUseUserNotifications(database, user)) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    const notificationRef = database.collection("users").doc(user.uid).collection("notifications").doc(notificationId);
+    const snapshot = await notificationRef.get();
+    if (!snapshot.exists) return response.status(404).json({ message: "Notification not found." });
+    if (snapshot.data()?.read !== true) {
+      await notificationRef.update({ read: true, readAt: new Date().toISOString() });
+    }
+    return response.json({ read: true });
+  } catch (error) {
+    console.error("Notification could not be marked as read.", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Notification could not be marked as read." });
+  }
+});
+
+app.post("/api/vendor/enquiries", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const rate = supplierEnquiryLimiter.check(`user:${user.uid}`);
+  if (!rate.allowed) return response.status(429).json({ message: "Too many enquiries. Try again later." });
+  let input;
+  try {
+    input = validateSupplierEnquiryInput(request.body);
+  } catch (error) {
+    return response.status(400).json({ message: error.message });
+  }
+  try {
+    const db = getDb();
+    const accountEmail = typeof user.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(user.email.trim())
+      ? user.email.trim()
+      : "";
+    if (input.shareEmail && !accountEmail) {
+      return response.status(400).json({ message: "Your account does not have a valid email address to share." });
+    }
+    const now = new Date().toISOString();
+    const enquiryRef = db.collection("vendorEnquiries").doc();
+    const requestId = input.requestId || randomUUID();
+    const requestRef = idempotencyRequestRef(db, "supplierEnquiryRequests", user.uid, requestId);
+    const result = await db.runTransaction(async (transaction) => {
+      const buyerRef = db.collection("users").doc(user.uid);
+      const productRef = db.collection("products").doc(input.productId);
+      const [buyerSnapshot, productSnapshot, requestSnapshot] = await Promise.all([
+        transaction.get(buyerRef),
+        transaction.get(productRef),
+        transaction.get(requestRef),
+      ]);
+      const buyer = buyerSnapshot.exists ? buyerSnapshot.data() : null;
+      if (!canCreateSupplierEnquiry(buyer, isAdminUser(user))) throw new Error("BUYER_NOT_ALLOWED");
+      if (requestSnapshot.exists) {
+        return { enquiryId: requestSnapshot.data().enquiryId, created: false };
+      }
+      if (!productSnapshot.exists) throw new Error("PRODUCT_NOT_FOUND");
+      const product = productSnapshot.data();
+      const vendorId = typeof product.sellerId === "string" ? product.sellerId.trim() : "";
+      const vendorSnapshot = vendorId
+        ? await transaction.get(db.collection("users").doc(vendorId))
+        : null;
+      const vendor = vendorSnapshot?.exists ? vendorSnapshot.data() : null;
+      if (!isEligibleVendorEnquiryProduct(product, vendor)) throw new Error("PRODUCT_NOT_ELIGIBLE");
+      const businessName = String(vendor.vendorProfile?.businessName || "").trim();
+      transaction.create(enquiryRef, {
+        buyerId: user.uid,
+        buyerEmail: input.shareEmail ? accountEmail : null,
+        vendorId,
+        vendorBusinessName: businessName,
+        productId: input.productId,
+        productName: String(product.name || product.title || "").trim(),
+        partNumber: typeof product.partNumber === "string" ? product.partNumber.trim() : "",
+        sellingPrice: Number(product.price),
+        quantity: input.quantity,
+        buyerMessage: input.message,
+        status: "new",
+        quoteAmount: null,
+        quoteMessage: "",
+        createdAt: now,
+        updatedAt: now,
+      });
+      transaction.create(requestRef, { userId: user.uid, enquiryId: enquiryRef.id, createdAt: now });
+      return {
+        enquiryId: enquiryRef.id,
+        created: true,
+        vendorId,
+        productName: String(product.name || product.title || "").trim(),
+      };
+    });
+    if (result.created) {
+      await recordSupplierNotification(db, result.vendorId, supplierNotification({
+        id: supplierNotificationId("vendor-enquiry", result.enquiryId),
+        type: "vendor-enquiry",
+        productName: result.productName,
+        enquiryId: result.enquiryId,
+        createdAt: now,
+      }));
+    }
+    return response.status(201).json({ enquiryId: result.enquiryId, status: "new" });
+  } catch (error) {
+    if (error.message === "BUYER_NOT_ALLOWED") return response.status(403).json({ message: "Customer or approved vendor access is required to send an enquiry." });
+    if (error.message === "PRODUCT_NOT_FOUND") return response.status(404).json({ message: "This product listing is unavailable." });
+    if (error.message === "PRODUCT_NOT_ELIGIBLE") return response.status(409).json({ message: "This vendor product is not currently available for enquiries." });
+    console.error("Supplier enquiry could not be created:", error?.code || error?.message || "request_error");
+    return response.status(500).json({ message: "Your enquiry could not be sent. Please try again." });
+  }
+});
+
+async function listSupplierEnquiries(request, response, ownerField, ownerId) {
+  const rate = supplierEnquiryReadLimiter.check(`user:${ownerId}`);
+  if (!rate.allowed) return response.status(429).json({ message: "Too many enquiry requests. Try again shortly." });
+  const cursor = typeof request.query.cursor === "string" ? request.query.cursor.trim() : "";
+  if (cursor && !isValidSupplierDocumentId(cursor)) return response.status(400).json({ message: "Invalid enquiry cursor." });
+  try {
+    const db = getDb();
+    const collectionRef = db.collection("vendorEnquiries");
+    let query = collectionRef.where(ownerField, "==", ownerId).orderBy(FieldPath.documentId()).limit(51);
+    if (cursor) {
+      const cursorSnapshot = await collectionRef.doc(cursor).get();
+      if (!cursorSnapshot.exists || cursorSnapshot.data()?.[ownerField] !== ownerId) {
+        return response.status(400).json({ message: "Invalid enquiry cursor." });
+      }
+      query = query.startAfter(cursorSnapshot);
+    }
+    const snapshot = await query.get();
+    const hasMore = snapshot.size > 50;
+    const documents = snapshot.docs.slice(0, 50);
+    const view = ownerField === "vendorId" ? "vendor" : "buyer";
+    const enquiries = documents.map((document) => serializeSupplierEnquiry(document.id, document.data(), view));
+    return response.json({
+      enquiries,
+      cursor: hasMore ? documents.at(-1)?.id || null : null,
+      hasMore,
+    });
+  } catch (error) {
+    console.error("Supplier enquiries could not be loaded:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiries could not be loaded." });
+  }
+}
+
+app.get("/api/enquiries", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const buyerSnapshot = await getDb().collection("users").doc(user.uid).get();
+    const buyer = buyerSnapshot.exists ? buyerSnapshot.data() : null;
+    if (!canCreateSupplierEnquiry(buyer, isAdminUser(user))) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    return listSupplierEnquiries(request, response, "buyerId", user.uid);
+  } catch (error) {
+    console.error("Buyer enquiry access could not be verified:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiries could not be loaded." });
+  }
+});
+
+app.get("/api/enquiries/:enquiryId", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const enquiryId = String(request.params.enquiryId || "").trim();
+  if (!isValidSupplierDocumentId(enquiryId)) return response.status(400).json({ message: "A valid enquiry ID is required." });
+  try {
+    const database = getDb();
+    const buyerSnapshot = await database.collection("users").doc(user.uid).get();
+    if (!canCreateSupplierEnquiry(buyerSnapshot.exists ? buyerSnapshot.data() : null, isAdminUser(user))) {
+      return response.status(403).json({ message: "Customer or approved vendor access is required." });
+    }
+    const snapshot = await database.collection("vendorEnquiries").doc(enquiryId).get();
+    if (!snapshot.exists || snapshot.data()?.buyerId !== user.uid) {
+      return response.status(404).json({ message: "Enquiry not found." });
+    }
+    return response.json({ enquiry: serializeSupplierEnquiry(snapshot.id, snapshot.data(), "buyer") });
+  } catch (error) {
+    console.error("Buyer supplier enquiry could not be loaded.", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiry could not be loaded." });
+  }
+});
+
+app.get("/api/vendor/enquiries", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  try {
+    const vendorSnapshot = await getDb().collection("users").doc(user.uid).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : null;
+    if (!vendor || vendor.role !== "vendor" || vendor.vendorStatus !== "approved" || isAdminUser(user)) {
+      return response.status(403).json({ message: "Approved vendor access is required." });
+    }
+    return listSupplierEnquiries(request, response, "vendorId", user.uid);
+  } catch (error) {
+    console.error("Vendor enquiry access could not be verified:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiries could not be loaded." });
+  }
+});
+
+app.get("/api/vendor/enquiries/:enquiryId", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const enquiryId = String(request.params.enquiryId || "").trim();
+  if (!isValidSupplierDocumentId(enquiryId)) return response.status(400).json({ message: "A valid enquiry ID is required." });
+  try {
+    const database = getDb();
+    const vendorSnapshot = await database.collection("users").doc(user.uid).get();
+    const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : null;
+    if (!vendor || vendor.role !== "vendor" || vendor.vendorStatus !== "approved" || isAdminUser(user)) {
+      return response.status(403).json({ message: "Approved vendor access is required." });
+    }
+    const snapshot = await database.collection("vendorEnquiries").doc(enquiryId).get();
+    if (!snapshot.exists || snapshot.data()?.vendorId !== user.uid) {
+      return response.status(404).json({ message: "Enquiry not found." });
+    }
+    return response.json({ enquiry: serializeSupplierEnquiry(snapshot.id, snapshot.data(), "vendor") });
+  } catch (error) {
+    console.error("Vendor supplier enquiry could not be loaded.", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Supplier enquiry could not be loaded." });
+  }
+});
+
+app.patch("/api/vendor/enquiries/:enquiryId/quote", async (request, response) => {
+  const user = await authenticatedUser(request, response);
+  if (!user) return;
+  const rate = supplierEnquiryLimiter.check(`quote:${user.uid}`);
+  if (!rate.allowed) return response.status(429).json({ message: "Too many quote updates. Try again later." });
+  const enquiryId = String(request.params.enquiryId || "").trim();
+  if (!isValidSupplierDocumentId(enquiryId)) return response.status(400).json({ message: "A valid enquiry ID is required." });
+  let quote;
+  try {
+    quote = validateSupplierQuoteInput(request.body);
+  } catch (error) {
+    return response.status(400).json({ message: error.message });
+  }
+  try {
+    const db = getDb();
+    const enquiryRef = db.collection("vendorEnquiries").doc(enquiryId);
+    const updatedAt = new Date().toISOString();
+    const requestId = quote.requestId || randomUUID();
+    const requestRef = idempotencyRequestRef(db, "supplierQuoteRequests", user.uid, `${enquiryId}:${requestId}`);
+    const result = await db.runTransaction(async (transaction) => {
+      const vendorRef = db.collection("users").doc(user.uid);
+      const [vendorSnapshot, enquirySnapshot, requestSnapshot] = await Promise.all([
+        transaction.get(vendorRef),
+        transaction.get(enquiryRef),
+        transaction.get(requestRef),
+      ]);
+      const vendor = vendorSnapshot.exists ? vendorSnapshot.data() : null;
+      if (!vendor || vendor.role !== "vendor" || vendor.vendorStatus !== "approved" || isAdminUser(user)) {
+        throw new Error("VENDOR_NOT_APPROVED");
+      }
+      if (!enquirySnapshot.exists) throw new Error("ENQUIRY_NOT_FOUND");
+      if (!canQuoteSupplierEnquiry(enquirySnapshot.data(), user.uid, vendor)) {
+        throw new Error("ENQUIRY_NOT_OWNED");
+      }
+      const enquiry = enquirySnapshot.data();
+      if (requestSnapshot.exists) {
+        const recordedAmount = Number(requestSnapshot.data()?.quoteAmount);
+        const currentAmount = Number(enquiry.quoteAmount);
+        return {
+          quoteAmount: Number.isFinite(recordedAmount) && recordedAmount > 0
+            ? recordedAmount
+            : currentAmount,
+          notify: false,
+        };
+      }
+      const notify = enquiry.status !== "quoted"
+        || Number(enquiry.quoteAmount) !== quote.amount
+        || enquiry.quoteMessage !== quote.message;
+      transaction.update(enquiryRef, {
+        status: "quoted",
+        quoteAmount: quote.amount,
+        quoteMessage: quote.message,
+        quoteCurrency: "INR",
+        quotedAt: updatedAt,
+        updatedAt,
+      });
+      transaction.create(requestRef, {
+        userId: user.uid,
+        enquiryId,
+        quoteAmount: quote.amount,
+        createdAt: updatedAt,
+      });
+      return {
+        quoteAmount: quote.amount,
+        notify,
+        buyerId: enquiry.buyerId,
+        productName: enquiry.productName,
+      };
+    });
+    if (result.notify) {
+      await recordSupplierNotification(db, result.buyerId, supplierNotification({
+        id: supplierNotificationId("customer-reply", `${enquiryId}:${requestId}`),
+        type: "customer-reply",
+        productName: result.productName,
+        enquiryId,
+        createdAt: updatedAt,
+      }));
+    }
+    return response.json({ enquiryId, status: "quoted", quoteAmount: result.quoteAmount });
+  } catch (error) {
+    if (error.message === "VENDOR_NOT_APPROVED") return response.status(403).json({ message: "Approved vendor access is required." });
+    if (error.message === "ENQUIRY_NOT_FOUND") return response.status(404).json({ message: "Enquiry not found." });
+    if (error.message === "ENQUIRY_NOT_OWNED") return response.status(403).json({ message: "This enquiry cannot be quoted by your account." });
+    console.error("Supplier quote could not be saved:", error?.code || "firestore_error");
+    return response.status(500).json({ message: "Your quote could not be saved. Please try again." });
+  }
+});
+
 app.post("/api/phone/verification", async (request, response) => {
   const user = await authenticatedUser(request, response);
   if (!user) return;

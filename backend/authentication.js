@@ -1,7 +1,7 @@
 const REVOCATION_CHECKED_PATHS = [
-  /^\/api\/(?:admin|checkout|orders|razorpay|phonepe|shiprocket|refunds)(?:\/|$)/,
+  /^\/api\/(?:admin|checkout|orders|razorpay|phonepe|shiprocket|refunds|enquiries)(?:\/|$)/,
   /^\/api\/phone\/verification$/,
-  /^\/api\/vendor\/(?:dashboard|finance|pickup-location)(?:\/|$)/,
+  /^\/api\/vendor\/(?:dashboard|finance|pickup-location|enquiries)(?:\/|$)/,
   /^\/api\/ai\/chat$/,
 ];
 

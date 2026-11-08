@@ -9,6 +9,7 @@ import { useToast } from "../context/useToast";
 import WhatsAppButton from "../components/WhatsAppButton";
 import ProductCard from "../components/productcard";
 import StarRating from "../components/StarRating";
+import SupplierEnquiryDialog from "../components/SupplierEnquiryDialog";
 import { ProductDetailSkeleton } from "../components/Skeleton";
 import "./ProductView.css";
 
@@ -30,6 +31,7 @@ export default function ProductView() {
   const [reviewRating, setReviewRating] = useState(0);
   const [reviewText, setReviewText] = useState("");
   const [submittingReview, setSubmittingReview] = useState(false);
+  const [enquiryOpen, setEnquiryOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -81,6 +83,7 @@ export default function ProductView() {
   const price = Number(product.price) || 0;
   const mrp = Number(product.mrp);
   const discountAmount = Number.isFinite(mrp) && mrp > price ? mrp - price : 0;
+  const isVendorListing = String(product.sellerType || "").toLowerCase() === "vendor";
 
   async function handleShare() {
     try {
@@ -133,7 +136,7 @@ export default function ProductView() {
           <div className="product-price-row">{discountAmount > 0 && <del>MRP ₹{mrp.toLocaleString("en-IN")}</del>}<strong>₹{price.toLocaleString("en-IN")}</strong><span>{product.priceIncludesGst === false ? "Before applicable GST" : "Inclusive of applicable taxes"}</span>{discountAmount > 0 && <span className="product-savings">You save ₹{discountAmount.toLocaleString("en-IN")}</span>}</div>
           <div className={`stock-line ${outOfStock ? "is-out" : ""}`}><span className="stock-indicator" />{outOfStock ? "Currently unavailable" : stock < 6 ? `Only ${stock} left in stock` : "In stock and ready to ship"}</div>
           <div className="product-quantity-row"><label htmlFor="product-quantity">Quantity</label><div className="quantity-control"><button type="button" onClick={() => setQty((value) => Math.max(1, value - 1))} aria-label="Decrease quantity" disabled={qty <= 1}><Minus size={15} /></button><input id="product-quantity" type="number" min="1" max={stock} value={qty} onChange={(event) => setQty(Math.max(1, Math.min(stock || 1, Number(event.target.value) || 1)))} /><button type="button" onClick={() => setQty((value) => Math.min(stock, value + 1))} aria-label="Increase quantity" disabled={qty >= stock}><Plus size={15} /></button></div><span className="quantity-available">{stock} available</span></div>
-          <button className="product-add-button" type="button" onClick={handleAdd} disabled={outOfStock}><ShoppingBag size={18} />{outOfStock ? "Unavailable" : `Add to cart · ₹${(price * qty).toLocaleString("en-IN")}`}</button>
+          {isVendorListing ? <button className="product-add-button" type="button" onClick={() => setEnquiryOpen(true)}>Request a quote from supplier</button> : <button className="product-add-button" type="button" onClick={handleAdd} disabled={outOfStock}><ShoppingBag size={18} />{outOfStock ? "Unavailable" : `Add to cart · ₹${(price * qty).toLocaleString("en-IN")}`}</button>}
           <WhatsAppButton productName={product.name} partNumber={product.partNumber || ""} className="product-whatsapp-button" />
           <div className="product-promises"><div><Truck size={17} /><span>Delivery options at checkout</span></div><div><ShieldCheck size={17} /><span>Secure payment</span></div><div><PackageCheck size={17} /><span>Quality checked parts</span></div></div>
         </section>
@@ -151,7 +154,8 @@ export default function ProductView() {
 
       {recent.length > 0 && <section className="product-recommendations"><div className="section-heading"><div><span className="product-eyebrow">YOUR BROWSING</span><h2>Recently viewed</h2></div></div><div className="recent-product-grid">{recent.map((item) => <Link to={`/products/${item.id}`} key={item.id} className="recent-product">{item.imageUrl ? <img src={item.imageUrl} alt={item.name} /> : <span className="recent-product-icon">{item.icon || "⚙"}</span>}<span>{item.name}</span><strong>₹{Number(item.price || 0).toLocaleString("en-IN")}</strong></Link>)}</div></section>}
       {relatedProducts.length > 0 && <section className="product-recommendations"><div className="section-heading"><div><span className="product-eyebrow">MORE FROM {String(product.category || "THIS CATEGORY").toUpperCase()}</span><h2>Related parts</h2></div><Link to="/products">Browse all <ArrowUpRight size={15} /></Link></div><div className="related-product-grid">{relatedProducts.map((item) => <ProductCard key={item.id} product={item} />)}</div></section>}
-      {showSticky && !outOfStock && <div className="product-mobile-buy"><span><small>{product.name}</small><strong>₹{(price * qty).toLocaleString("en-IN")}</strong></span><button type="button" onClick={handleAdd}><ShoppingBag size={17} /> Add to cart</button></div>}
+      {showSticky && !outOfStock && <div className="product-mobile-buy"><span><small>{product.name}</small><strong>₹{(price * qty).toLocaleString("en-IN")}</strong></span>{isVendorListing ? <button type="button" onClick={() => setEnquiryOpen(true)}>Request quote</button> : <button type="button" onClick={handleAdd}><ShoppingBag size={17} /> Add to cart</button>}</div>}
+      {isVendorListing && <SupplierEnquiryDialog product={product} businessName={product.vendorBusinessName || product.vendorName || ""} open={enquiryOpen} onClose={() => setEnquiryOpen(false)} />}
     </main>
   );
 }

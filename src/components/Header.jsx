@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/useAuth';
 import { useCart } from '../context/useCart';
 import { getProductsPage } from '../services/productService';
+import NotificationBell from './NotificationBell';
 
 const PistonAssembly3D = lazy(() => import('./PistonAssembly3D'));
 
@@ -113,7 +114,9 @@ export default function Header() {
           <Link to="/" className="hover:text-white transition-colors">Home</Link>
           <Link to="/products" className="hover:text-white transition-colors">Products</Link>
           <Link to="/orders" className="hover:text-white transition-colors">Orders</Link>
-          {isVendor && <Link to="/vendor" className="hover:text-white transition-colors">Dashboard</Link>}
+          {isVendor
+            ? <><Link to="/vendor" className="hover:text-white transition-colors">Dashboard</Link><Link to="/vendor/enquiries" className="hover:text-white transition-colors">Enquiries</Link></>
+            : isLoggedIn && !isAdmin && <Link to="/my-enquiries" className="hover:text-white transition-colors">My Enquiries</Link>}
           {isAdmin && (
             <Link 
               to="/admin" 
@@ -168,6 +171,8 @@ export default function Header() {
             </div>
           )}
         </div>
+
+        <NotificationBell />
 
         {/* Cart Icon */}
         <Link id="cart-icon" to="/cart" aria-label={`Cart with ${cartCount} items`} className="relative text-slate-400 hover:text-white transition-colors flex items-center justify-center">
