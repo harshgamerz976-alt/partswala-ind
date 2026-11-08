@@ -5,7 +5,7 @@ import { getProductById, getPublicVendorWhatsAppNumber, getRelatedProducts } fro
 import { addReview, getProductReviews } from "../services/reviewService";
 import { useAuth } from "../context/useAuth";
 import { useToast } from "../context/useToast";
-import { createSupplierEnquiry } from "../services/supplierEnquiryService";
+import { createSupplierEnquiry, getSubmissionRequest } from "../services/supplierEnquiryService";
 import { getKnownProductStock, getProductTaxLabel } from "../services/productPresentation";
 import WhatsAppButton from "../components/WhatsAppButton";
 import ProductCard from "../components/productcard";
@@ -42,6 +42,7 @@ export default function ProductView() {
   const [enquiryError, setEnquiryError] = useState("");
   const [submittedEnquiryId, setSubmittedEnquiryId] = useState("");
   const enquiryRequestGeneration = useRef(0);
+  const enquiryRequest = useRef(null);
 
   useEffect(() => {
     let active = true;
@@ -62,6 +63,7 @@ export default function ProductView() {
 
   useEffect(() => {
     enquiryRequestGeneration.current += 1;
+    enquiryRequest.current = null;
     setEnquiryQuantity("1");
     setEnquiryMessage("");
     setShareEmail(false);
@@ -183,16 +185,20 @@ export default function ProductView() {
       return;
     }
     const generation = ++enquiryRequestGeneration.current;
+    const enquiryPayload = {
+      productId: id,
+      quantity,
+      message: enquiryMessage.trim(),
+      shareEmail,
+    };
+    const submission = getSubmissionRequest(enquiryRequest.current, JSON.stringify(enquiryPayload));
+    enquiryRequest.current = submission;
     setSubmittingEnquiry(true);
     setEnquiryError("");
     try {
-      const result = await createSupplierEnquiry(currentUser, {
-        productId: id,
-        quantity,
-        message: enquiryMessage.trim(),
-        shareEmail,
-      });
+      const result = await createSupplierEnquiry(currentUser, { ...enquiryPayload, requestId: submission.requestId });
       if (generation !== enquiryRequestGeneration.current) return;
+      if (enquiryRequest.current === submission) enquiryRequest.current = null;
       setSubmittedEnquiryId(result.enquiryId);
       addToast("Your quote request has been sent", "success");
     } catch (error) {

@@ -9,6 +9,13 @@ function cleanText(value, maxLength) {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
 }
 
+export function isFcmPushEnabled(environment = process.env) {
+  return environment.FCM_PUSH_ENABLED === "true"
+    && environment.NODE_ENV !== "test"
+    && !environment.FIRESTORE_EMULATOR_HOST
+    && !environment.FIREBASE_AUTH_EMULATOR_HOST;
+}
+
 export function canUseUserNotifications(profile, isAdmin = false) {
   return !isAdmin && canCreateSupplierEnquiry(profile, false);
 }
@@ -170,6 +177,7 @@ export async function sendNotificationPush({ database, messaging, recipientId, n
 
 export async function persistSupplierNotification({ database, messaging, recipientId, notification }) {
   if (!/^[a-f0-9]{64}$/i.test(notification.id)) throw new Error("A valid notification ID is required.");
+  if (typeof recipientId !== "string" || !recipientId.trim()) throw new Error("A valid notification recipient is required.");
   const notificationRef = database.collection("users").doc(recipientId).collection("notifications").doc(notification.id);
   const created = await database.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(notificationRef);
@@ -178,6 +186,7 @@ export async function persistSupplierNotification({ database, messaging, recipie
     return true;
   });
   if (!created) return { created: false, sent: [], failed: [], removed: [] };
+  if (!messaging) return { created: true, sent: [], failed: [], removed: [] };
   const delivery = await sendNotificationPush({ database, messaging, recipientId, notification });
   return { created: true, ...delivery };
 }

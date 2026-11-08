@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../context/useAuth";
-import { getSupplierEnquiries, sendSupplierQuote } from "../services/supplierEnquiryService";
+import { getSubmissionRequest, getSupplierEnquiries, sendSupplierQuote } from "../services/supplierEnquiryService";
 
 function formatPrice(value) {
   const amount = Number(value);
@@ -20,6 +20,7 @@ export default function SupplierEnquiries({ audience }) {
   const [savingId, setSavingId] = useState("");
   const [sentIds, setSentIds] = useState([]);
   const requestGeneration = useRef(0);
+  const quoteRequests = useRef(new Map());
 
   const authorized = audience === "vendor"
     ? isVendor
@@ -50,6 +51,7 @@ export default function SupplierEnquiries({ audience }) {
     setCursor(null);
     setHasMore(false);
     setQuoteDrafts({});
+    quoteRequests.current.clear();
     setSentIds([]);
     setLoadingMore(false);
     setSavingId("");
@@ -101,11 +103,18 @@ export default function SupplierEnquiries({ audience }) {
       return;
     }
     const generation = requestGeneration.current;
+    const quotePayload = { amount, message };
+    const submission = getSubmissionRequest(
+      quoteRequests.current.get(enquiry.id),
+      JSON.stringify(quotePayload),
+    );
+    quoteRequests.current.set(enquiry.id, submission);
     setSavingId(enquiry.id);
     setError("");
     try {
-      await sendSupplierQuote(currentUser, enquiry.id, { amount, message });
+      await sendSupplierQuote(currentUser, enquiry.id, { ...quotePayload, requestId: submission.requestId });
       if (generation !== requestGeneration.current) return;
+      if (quoteRequests.current.get(enquiry.id) === submission) quoteRequests.current.delete(enquiry.id);
       setSentIds((previous) => [...new Set([...previous, enquiry.id])]);
       await loadFirstPage();
     } catch (requestError) {

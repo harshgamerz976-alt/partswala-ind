@@ -26,11 +26,13 @@ test("supplier enquiries accept valid quantity, message, and explicit email cons
     quantity: 12,
     message: "Please quote the lead time and price.",
     shareEmail: true,
+    requestId: "7e4e2be8-fc4d-4b73-99d6-f642f85ec051",
   }), {
     productId: "product-1",
     quantity: 12,
     message: "Please quote the lead time and price.",
     shareEmail: true,
+    requestId: "7e4e2be8-fc4d-4b73-99d6-f642f85ec051",
   });
 });
 
@@ -45,7 +47,13 @@ test("supplier enquiries reject invalid IDs, quantities, messages, and consent v
     { productId: "p", quantity: 1, message: " \n " },
     { productId: "p", quantity: 1, message: "Quote", shareEmail: "yes" },
     { productId: "p", quantity: 1, message: `bad${String.fromCharCode(1)}text` },
+    { productId: "p", quantity: 1, message: "Quote", requestId: "not-a-uuid" },
   ]) assert.throws(() => validateSupplierEnquiryInput(payload));
+  assert.equal(validateSupplierEnquiryInput({
+    productId: "p",
+    quantity: 1,
+    message: "Quote",
+  }).requestId, "");
 });
 
 test("only approved, published vendor products with real prices qualify for enquiries", () => {
@@ -78,10 +86,15 @@ test("conflicting approval fields fail closed while published schema statuses re
   assert.equal(isEligibleVendorEnquiryProduct({ ...visibleProduct, status: "approved" }, approvedVendor), true);
 });
 
-test("supplier quotes require a finite positive amount and message", () => {
-  assert.deepEqual(validateSupplierQuoteInput({ amount: 1234.567, message: "Available from stock." }), {
+test("supplier quotes require a finite positive amount, message, and valid optional request ID", () => {
+  assert.deepEqual(validateSupplierQuoteInput({
+    amount: 1234.567,
+    message: "Available from stock.",
+    requestId: "7e4e2be8-fc4d-4b73-99d6-f642f85ec051",
+  }), {
     amount: 1234.57,
     message: "Available from stock.",
+    requestId: "7e4e2be8-fc4d-4b73-99d6-f642f85ec051",
   });
   for (const payload of [
     null,
@@ -90,7 +103,9 @@ test("supplier quotes require a finite positive amount and message", () => {
     { amount: 0, message: "Quote" },
     { amount: Infinity, message: "Quote" },
     { amount: 100, message: " " },
+    { amount: 100, message: "Quote", requestId: "not-a-uuid" },
   ]) assert.throws(() => validateSupplierQuoteInput(payload));
+  assert.equal(validateSupplierQuoteInput({ amount: 100, message: "Quote" }).requestId, "");
 });
 
 test("only customers and approved vendors may create enquiries; admins and pending vendors may not", () => {

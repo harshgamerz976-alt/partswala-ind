@@ -58,6 +58,7 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
   const createdOrderIds = [];
   const createdSettlementIds = [];
   const createdReviewIds = [];
+  const createdRequestRefs = [];
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
@@ -148,11 +149,20 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
   }
 
   async function cleanup() {
+    const userSubcollectionRefs = [];
+    for (const uid of createdUserIds) {
+      for (const collectionName of ["notifications", "fcmTokens"]) {
+        const snapshot = await database.collection("users").doc(uid).collection(collectionName).get();
+        userSubcollectionRefs.push(...snapshot.docs.map(({ ref }) => ref));
+      }
+    }
     await Promise.all([
       ...createdEnquiryIds.map((id) => database.collection("vendorEnquiries").doc(id).delete()),
       ...createdOrderIds.map((id) => database.collection("orders").doc(id).delete()),
       ...createdSettlementIds.map((id) => database.collection("vendorSettlements").doc(id).delete()),
       ...createdReviewIds.map((id) => database.collection("reviews").doc(id).delete()),
+      ...createdRequestRefs.map((reference) => reference.delete()),
+      ...userSubcollectionRefs.map((reference) => reference.delete()),
       ...createdProductIds.map((id) => database.collection("products").doc(id).delete()),
       ...createdUserIds.map((uid) => database.collection("users").doc(uid).delete()),
       ...createdUserIds.map((uid) => auth.deleteUser(uid)),
@@ -599,6 +609,18 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
       app.locals.launchClock = () => launchTime - 1;
     });
 
+    await t.test("admin-claim accounts cannot access notification registration or read routes", async () => {
+      assert.equal((await apiRequest("/api/notifications/fcm-token", {
+        method: "POST",
+        token: admin.token,
+        body: { token: "admin-must-not-register-this-token" },
+      })).status, 403);
+      assert.equal((await apiRequest("/api/notifications/read-all", {
+        method: "PATCH",
+        token: admin.token,
+      })).status, 403);
+    });
+
     await t.test("vendor-name POST stays closed before launch and returns eligible products at launch", async () => {
       const closed = await apiRequest("/api/products/vendor-names", {
         method: "POST",
@@ -659,6 +681,7 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
 
     let privateEnquiryId;
     let consentedEnquiryId;
+    const enquiryRequestId = "96d57ad4-6ea4-4a46-86e7-4e8d1eab7df7";
     await t.test("customer creation ignores caller-controlled identity, status, and quote fields", async () => {
       const response = await apiRequest("/api/vendor/enquiries", {
         method: "POST",
@@ -673,11 +696,28 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
           status: "quoted",
           quoteAmount: 1,
           shareEmail: false,
+          requestId: enquiryRequestId,
         },
       });
       assert.equal(response.status, 201);
       privateEnquiryId = response.body.enquiryId;
       createdEnquiryIds.push(privateEnquiryId);
+      const requestRef = database.collection("supplierEnquiryRequests")
+        .doc(createHash("sha256").update(buyer.uid).update("\0").update(enquiryRequestId).digest("hex"));
+      createdRequestRefs.push(requestRef);
+      const retry = await apiRequest("/api/vendor/enquiries", {
+        method: "POST",
+        token: buyer.token,
+        body: {
+          productId: eligibleProductId,
+          quantity: 3,
+          message: "Please quote this part.",
+          requestId: enquiryRequestId,
+        },
+      });
+      assert.equal(retry.status, 201);
+      assert.equal(retry.body.enquiryId, privateEnquiryId);
+      assert.equal((await database.collection("users").doc(ownerVendor.uid).collection("notifications").get()).size, 1);
       const stored = (await database.collection("vendorEnquiries").doc(privateEnquiryId).get()).data();
       assert.equal(stored.buyerId, buyer.uid);
       assert.equal(stored.vendorId, ownerVendor.uid);
@@ -728,6 +768,24 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
       assert.equal((await apiRequest("/api/enquiries?cursor=bad%2Fcursor", { token: buyer.token })).status, 400);
     });
 
+    await t.test("enquiry detail endpoints enforce ownership and customer launch gating", async () => {
+      const buyerPath = `/api/enquiries/${privateEnquiryId}`;
+      const vendorPath = `/api/vendor/enquiries/${privateEnquiryId}`;
+      app.locals.launchClock = () => launchTime - 1;
+      assert.equal((await apiRequest(buyerPath, { token: buyer.token })).status, 403);
+      assert.equal((await apiRequest(vendorPath, { token: ownerVendor.token })).status, 200);
+
+      app.locals.launchClock = () => launchTime;
+      const buyerResponse = await apiRequest(buyerPath, { token: buyer.token });
+      assert.equal(buyerResponse.status, 200);
+      assert.equal(buyerResponse.body.enquiry.id, privateEnquiryId);
+      assert.equal((await apiRequest(buyerPath, { token: otherBuyer.token })).status, 404);
+      assert.equal((await apiRequest(vendorPath, { token: otherVendor.token })).status, 404);
+      assert.equal((await apiRequest(vendorPath, { token: pendingVendor.token })).status, 403);
+      assert.equal((await apiRequest(buyerPath, { token: admin.token })).status, 403);
+      assert.equal((await apiRequest(vendorPath, { token: admin.token })).status, 403);
+    });
+
     await t.test("only the approved product owner may quote; amount and status are server-controlled", async () => {
       app.locals.launchClock = () => launchTime - 1;
       assert.equal((await apiRequest("/api/enquiries", { token: buyer.token })).status, 403);
@@ -752,6 +810,7 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
         token: admin.token,
         body: { amount: 100, message: "Admin quote" },
       })).status, 403);
+      const quoteRequestId = "b49fb78b-707b-4817-b90a-1506737e03a8";
       const quote = await apiRequest(`/api/vendor/enquiries/${privateEnquiryId}/quote`, {
         method: "PATCH",
         token: ownerVendor.token,
@@ -760,6 +819,7 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
           message: "Price valid for this request.",
           status: "closed",
           vendorId: otherVendor.uid,
+          requestId: quoteRequestId,
         },
       });
       assert.equal(quote.status, 200);
@@ -770,6 +830,21 @@ test("supplier enquiry routes enforce auth, ownership, eligibility, and quote ru
       assert.equal(stored.status, "quoted");
       assert.equal(stored.quoteAmount, 1234.57);
       assert.equal(stored.quoteCurrency, "INR");
+      const quoteRequestRef = database.collection("supplierQuoteRequests")
+        .doc(createHash("sha256").update(ownerVendor.uid).update("\0").update(`${privateEnquiryId}:${quoteRequestId}`).digest("hex"));
+      createdRequestRefs.push(quoteRequestRef);
+      const retry = await apiRequest(`/api/vendor/enquiries/${privateEnquiryId}/quote`, {
+        method: "PATCH",
+        token: ownerVendor.token,
+        body: {
+          amount: 9999,
+          message: "A conflicting retry must not overwrite the original quote.",
+          requestId: quoteRequestId,
+        },
+      });
+      assert.equal(retry.status, 200);
+      assert.equal(retry.body.quoteAmount, 1234.57);
+      assert.equal((await database.collection("users").doc(buyer.uid).collection("notifications").get()).size, 1);
       assert.equal((await apiRequest(`/api/vendor/enquiries/${privateEnquiryId}/quote`, {
         method: "PATCH",
         token: ownerVendor.token,

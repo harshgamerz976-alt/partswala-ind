@@ -1,5 +1,10 @@
 import { BACKEND_API_URL } from "./backendApiUrl.js";
 
+export function getSubmissionRequest(current, signature) {
+  if (current?.signature === signature) return current;
+  return { signature, requestId: crypto.randomUUID() };
+}
+
 async function request(user, path, { method = "GET", body } = {}, fetchImpl = fetch) {
   if (!user || typeof user.getIdToken !== "function") {
     throw new Error("Sign in to access supplier enquiries.");
@@ -35,9 +40,10 @@ export async function getSupplierEnquiries(user, audience, cursor = null, fetchI
 }
 
 export async function createSupplierEnquiry(user, payload, fetchImpl = fetch) {
+  const requestId = payload.requestId || crypto.randomUUID();
   const result = await request(user, "/api/vendor/enquiries", {
     method: "POST",
-    body: payload,
+    body: { ...payload, requestId },
   }, fetchImpl);
   if (typeof result.enquiryId !== "string" || result.status !== "new") {
     throw new Error("The supplier enquiry response was invalid.");
@@ -49,9 +55,10 @@ export async function sendSupplierQuote(user, enquiryId, payload, fetchImpl = fe
   if (typeof enquiryId !== "string" || !enquiryId.trim() || enquiryId.includes("/")) {
     throw new Error("A valid enquiry ID is required.");
   }
+  const requestId = payload.requestId || crypto.randomUUID();
   const result = await request(user, `/api/vendor/enquiries/${encodeURIComponent(enquiryId)}/quote`, {
     method: "PATCH",
-    body: payload,
+    body: { ...payload, requestId },
   }, fetchImpl);
   if (result.enquiryId !== enquiryId || result.status !== "quoted") {
     throw new Error("The supplier quote response was invalid.");

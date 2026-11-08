@@ -4,11 +4,20 @@ import {
   buildFcmPayload,
   canUseUserNotifications,
   fcmTokenDocumentId,
+  isFcmPushEnabled,
   persistSupplierNotification,
   supplierNotification,
   supplierNotificationId,
   validateFcmToken,
 } from "./notifications.js";
+
+test("FCM is opt-in and disabled during tests and Firebase emulators", () => {
+  assert.equal(isFcmPushEnabled({ FCM_PUSH_ENABLED: "true" }), true);
+  assert.equal(isFcmPushEnabled({ FCM_PUSH_ENABLED: "false" }), false);
+  assert.equal(isFcmPushEnabled({ FCM_PUSH_ENABLED: "true", NODE_ENV: "test" }), false);
+  assert.equal(isFcmPushEnabled({ FCM_PUSH_ENABLED: "true", FIRESTORE_EMULATOR_HOST: "127.0.0.1:8080" }), false);
+  assert.equal(isFcmPushEnabled({ FCM_PUSH_ENABLED: "true", FIREBASE_AUTH_EMULATOR_HOST: "127.0.0.1:9099" }), false);
+});
 
 test("notification access is limited to customers and approved vendors, never admins", () => {
   assert.equal(canUseUserNotifications({ role: "customer" }), true);
@@ -113,4 +122,52 @@ test("notification persistence deduplicates the same business event before sendi
   assert.equal(sends, 1);
   assert.equal(stored.read, false);
   assert.equal(Object.hasOwn(stored, "buyerMessage"), false);
+});
+
+test("notification persistence is retained when push delivery is disabled", async () => {
+  let stored;
+  const notification = supplierNotification({
+    id: supplierNotificationId("vendor-enquiry", "enquiry-disabled-push"),
+    type: "vendor-enquiry",
+    productName: "Clutch plate",
+    enquiryId: "enquiry-disabled-push",
+    createdAt: "2026-10-21T12:00:00.000Z",
+  });
+  const reference = {
+    async get() {
+      return { exists: Boolean(stored) };
+    },
+  };
+  const database = {
+    collection(path) {
+      assert.equal(path, "users");
+      return {
+        doc(userId) {
+          assert.equal(userId, "vendor-1");
+          return {
+            collection(name) {
+              assert.equal(name, "notifications");
+              return { doc: () => reference };
+            },
+          };
+        },
+      };
+    },
+    async runTransaction(callback) {
+      return callback({
+        get: (ref) => ref.get(),
+        create: (_ref, value) => { stored = value; },
+      });
+    },
+  };
+  const result = await persistSupplierNotification({
+    database,
+    messaging: null,
+    recipientId: "vendor-1",
+    notification,
+  });
+  assert.equal(result.created, true);
+  assert.deepEqual(result.sent, []);
+  assert.equal(stored.id, notification.id);
+  assert.equal(stored.read, false);
 });

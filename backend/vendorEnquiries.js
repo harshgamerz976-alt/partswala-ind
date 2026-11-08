@@ -1,3 +1,5 @@
+import { isValidRequestId } from "../shared/requestIds.js";
+
 const hiddenProductStatuses = new Set([
   "draft",
   "deleted",
@@ -78,7 +80,16 @@ export function validateSupplierEnquiryInput(payload = {}) {
   if (payload.shareEmail !== undefined && typeof payload.shareEmail !== "boolean") {
     throw new Error("Choose whether to share your account email with the supplier.");
   }
-  return { productId, quantity, message, shareEmail: payload.shareEmail === true };
+  if (payload.requestId !== undefined && !isValidRequestId(payload.requestId)) {
+    throw new Error("A valid enquiry request ID is required.");
+  }
+  return {
+    productId,
+    quantity,
+    message,
+    shareEmail: payload.shareEmail === true,
+    requestId: payload.requestId || "",
+  };
 }
 
 export function validateSupplierQuoteInput(payload = {}) {
@@ -97,7 +108,14 @@ export function validateSupplierQuoteInput(payload = {}) {
     throw new Error("Enter a valid positive quote amount in INR.");
   }
   if (!message) throw new Error("Write quote details of up to 2,000 characters.");
-  return { amount: Number(amount.toFixed(2)), message };
+  if (payload.requestId !== undefined && !isValidRequestId(payload.requestId)) {
+    throw new Error("A valid quote request ID is required.");
+  }
+  return {
+    amount: Number(amount.toFixed(2)),
+    message,
+    requestId: payload.requestId || "",
+  };
 }
 
 export function canCreateSupplierEnquiry(profile, isAdmin) {
