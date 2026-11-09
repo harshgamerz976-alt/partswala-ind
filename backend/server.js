@@ -77,8 +77,9 @@ import {
   BULK_IMPORT_LIMITS,
   REQUIRED_IMPORT_COLUMNS,
   buildVendorImportKey,
-  buildVendorImportUpdate,
+  buildVendorImportCreate,
   generateVendorBulkImportWorkbook,
+  isVendorBulkImportInputError,
   parseBulkImportFile,
   previewVendorBulkImport,
 } from "./vendorBulkImport.js";
@@ -2170,7 +2171,7 @@ app.post("/api/vendor/import-products", authorizeVendorBulkImport, parseVendorBu
     const existingSnapshot = await db.collection("products").where("sellerId", "==", user.uid).get();
     const existingKeys = existingSnapshot.docs.map((document) => {
       const product = document.data();
-      return buildVendorImportKey(user.uid, product.partNumber, product.brand);
+      return buildVendorImportKey(user.uid, product);
     });
     const preview = previewVendorBulkImport(parsed, user.uid, existingKeys);
     const confirm = request.body && (request.body.confirm === true || request.body.confirm === "true");
@@ -2185,7 +2186,7 @@ app.post("/api/vendor/import-products", authorizeVendorBulkImport, parseVendorBu
         errors: preview.errors,
         importMode: "preview",
         requiredColumns: REQUIRED_IMPORT_COLUMNS,
-        reImportBehavior: "Matching part number + brand updates the vendor's existing record; duplicate rows within the same file are still rejected.",
+        reImportBehavior: "Rows with identical required fields and optional Category/Compatible Vehicle are treated as the same product. Existing listings are preserved; differences create separate products. Quantity is excluded from duplicate matching and is never summed.",
       });
     }
     if (!preview.rows.length) {
@@ -2194,7 +2195,7 @@ app.post("/api/vendor/import-products", authorizeVendorBulkImport, parseVendorBu
     const existingByKey = new Map();
     for (const snapshot of existingSnapshot.docs) {
       const data = snapshot.data();
-      existingByKey.set(buildVendorImportKey(user.uid, data.partNumber, data.brand), snapshot.ref);
+      existingByKey.set(buildVendorImportKey(user.uid, data), snapshot.ref);
     }
     const imported = [];
     for (const product of preview.rows) {
@@ -2206,14 +2207,13 @@ app.post("/api/vendor/import-products", authorizeVendorBulkImport, parseVendorBu
         const existingProduct = snapshot.exists ? snapshot.data() : null;
         if (existingProduct && (
           existingProduct.sellerId !== user.uid
-          || buildVendorImportKey(user.uid, existingProduct.partNumber, existingProduct.brand) !== product.vendorImportKey
+          || buildVendorImportKey(user.uid, existingProduct) !== product.vendorImportKey
         )) {
           throw new Error("IMPORT_PRODUCT_IDENTITY_CONFLICT");
         }
-        const payload = buildVendorImportUpdate(existingProduct || {}, product, user.uid);
-        if (snapshot.exists) transaction.update(reference, payload);
-        else transaction.create(reference, payload);
-        return { id: reference.id, updateExisting: Boolean(existingProduct) };
+        if (snapshot.exists) return { id: reference.id, alreadyExists: true };
+        transaction.create(reference, buildVendorImportCreate(product, user.uid));
+        return { id: reference.id, alreadyExists: false };
       });
       imported.push({ ...result, partNumber: product.partNumber, brand: product.brand });
       existingByKey.set(product.vendorImportKey, reference);
@@ -2244,10 +2244,7 @@ app.post("/api/vendor/import-products", authorizeVendorBulkImport, parseVendorBu
     if (message === "IMPORT_PRODUCT_IDENTITY_CONFLICT") {
       return response.status(409).json({ message: "A product identity conflict prevented this import. Refresh the preview and try again." });
     }
-    if (message.includes("Unsupported file type") || message.includes("empty") || message.includes("row limit") || message.includes("column count") || message.includes("required header") || message.includes("worksheet") || message.includes("spreadsheet could not be read") || message.includes("no valid product rows")) {
-      return response.status(400).json({ message });
-    }
-    if (message.includes("Malicious spreadsheet content")) {
+    if (isVendorBulkImportInputError(error)) {
       return response.status(400).json({ message });
     }
     console.error("Vendor bulk import failed:", error);

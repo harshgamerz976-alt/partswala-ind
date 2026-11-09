@@ -85,8 +85,8 @@ export default function BulkUpload() {
   }
 
   const imported = summary?.summary;
-  const createdCount = summary?.imported?.filter((item) => !item.updateExisting).length ?? 0;
-  const updatedCount = summary?.imported?.filter((item) => item.updateExisting).length ?? 0;
+  const createdCount = summary?.imported?.filter((item) => !item.alreadyExists).length ?? 0;
+  const existingCount = summary?.imported?.filter((item) => item.alreadyExists).length ?? 0;
 
   return (
     <main className="vendor-page">
@@ -105,9 +105,14 @@ export default function BulkUpload() {
           <FileSpreadsheet aria-hidden="true" />
         </div>
         <p className="vendor-muted">
-          Use the template to prepare your spreadsheet. New products are submitted for review;
-          matching part number and brand pairs update your own existing listings.
+          Use the template to prepare your spreadsheet. New products are submitted for review.
+          Matching products are preserved, and different product details create separate listings.
         </p>
+        <div className="vendor-muted mt-3 rounded border border-slate-700 bg-slate-950/40 p-3 text-sm">
+          <p><strong className="text-slate-200">Required columns:</strong> Part Number, Brand, Description, Selling Price, MRP, Availability / Stock.</p>
+          <p className="mt-1"><strong className="text-slate-200">Optional columns:</strong> Category, Compatible Vehicle, Quantity.</p>
+          <p className="mt-1">Quantity does not affect duplicate matching and is never summed.</p>
+        </div>
         <button className="vendor-secondary mt-4" type="button" onClick={downloadTemplate} disabled={Boolean(busy)}>
           {busy === "template" ? <Loader2 className="animate-spin" size={15} /> : <Download size={15} />}
           {busy === "template" ? "Preparing template…" : "Download Excel template (.xlsx)"}
@@ -138,7 +143,7 @@ export default function BulkUpload() {
             <h2 className="font-bold text-emerald-200">Import completed</h2>
             <p className="mt-2 text-sm text-slate-200">
               {imported?.imported ?? summary.imported?.length ?? 0} products processed:
-              {" "}{createdCount} new and {updatedCount} updated.
+              {" "}{createdCount} new and {existingCount} matching existing.
               {imported?.invalidRows ? ` ${imported.invalidRows} invalid rows were skipped.` : ""}
             </p>
             {summary.warnings?.length > 0 && (
@@ -165,7 +170,7 @@ export default function BulkUpload() {
               ["Total rows", preview.totalRows],
               ["Valid rows", preview.validRows],
               ["Invalid rows", preview.invalidRows],
-              ["Existing listings to update", preview.duplicates],
+              ["Duplicate rows / existing matches", preview.duplicates],
             ].map(([label, value]) => (
               <div className="rounded border border-slate-700 bg-slate-950/60 p-3" key={label}>
                 <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>
@@ -188,7 +193,7 @@ export default function BulkUpload() {
                       <td>{row.partNumber}</td>
                       <td>{row.brand}</td>
                       <td>{formatPrice(row.price)}</td>
-                      <td>{row.updateExisting ? "Update your listing" : "Create pending review"}</td>
+                      <td>{row.alreadyExists ? "Keep existing listing" : "Create pending review"}</td>
                     </tr>
                   ))}
                 </tbody>

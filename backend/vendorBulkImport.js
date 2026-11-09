@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import XLSX from "xlsx";
 
 export const BULK_IMPORT_LIMITS = {
@@ -10,11 +11,32 @@ export const REQUIRED_IMPORT_COLUMNS = [
   "partNumber",
   "brand",
   "description",
-  "mrp",
   "price",
+  "mrp",
   "stock",
-  "compatibility",
 ];
+
+export const OPTIONAL_IMPORT_COLUMNS = [
+  "category",
+  "compatibility",
+  "quantity",
+];
+
+export function isVendorBulkImportInputError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return [
+    "unsupported file type",
+    "empty",
+    "row limit",
+    "column count",
+    "required column",
+    "required header",
+    "worksheet",
+    "spreadsheet could not be read",
+    "no valid product rows",
+    "malicious spreadsheet content",
+  ].some((phrase) => message.includes(phrase));
+}
 
 const HEADER_ALIASES = {
   "part name": "name",
@@ -31,8 +53,8 @@ const HEADER_ALIASES = {
   "mrp": "mrp",
   "minimum order quantity": "moq",
   "moq": "moq",
-  "qty": "stock",
-  "quantity": "stock",
+  "qty": "quantity",
+  "quantity": "quantity",
   "availability": "stock",
   "availability stock": "stock",
   "stock": "stock",
@@ -49,10 +71,12 @@ const IMPORT_TEMPLATE_COLUMNS = [
   "Part Number",
   "Brand",
   "Description",
-  "MRP",
   "Selling Price",
-  "Availability/Stock",
+  "MRP",
+  "Availability / Stock",
+  "Category",
   "Compatible Vehicle",
+  "Quantity",
 ];
 
 function normalizeHeader(rawHeader) {
@@ -237,40 +261,45 @@ export function buildVendorImportProduct(row, vendorId) {
   const name = sanitizeCellValue(pickValue(values, ["name", "product_name", "part_name"])) || description;
   const partNumber = sanitizeCellValue(pickValue(values, ["partNumber", "part_number", "sku"]));
   const brand = sanitizeCellValue(pickValue(values, ["brand", "manufacturer"]));
-  const price = parseImportNumber(pickValue(values, ["price", "selling_price", "price_in_inr"]));
-  const mrp = parseImportNumber(pickValue(values, ["mrp", "listed_mrp", "maximum_retail_price"]));
-  const stockValue = parseImportNumber(pickValue(values, ["stock", "availability", "quantity"]));
+  const priceValue = pickValue(values, ["price", "selling_price", "price_in_inr"]);
+  const mrpValue = pickValue(values, ["mrp", "listed_mrp", "maximum_retail_price"]);
+  const stockValue = pickValue(values, ["stock", "availability"]);
+  const price = parseImportNumber(priceValue);
+  const mrp = mrpValue === "" ? null : parseImportNumber(mrpValue);
+  const stock = stockValue === "" ? null : parseImportNumber(stockValue);
+  const quantityValue = pickValue(values, ["quantity", "qty"]);
+  const quantity = quantityValue === "" ? null : parseImportNumber(quantityValue);
   const moqValue = parseImportNumber(pickValue(values, ["moq", "minimum_order_quantity"]) || "1");
   const vehicleMake = sanitizeCellValue(pickValue(values, ["vehicleMake", "make", "manufacturer_name"])) || "";
   const vehicleModel = sanitizeCellValue(pickValue(values, ["vehicleModel", "model"])) || "";
   const vehicleYear = sanitizeCellValue(pickValue(values, ["vehicleYear", "year"])) || "";
-  const compatibility = sanitizeCellValue(pickValue(values, ["compatibility", "vehicle_compatibility"])) || [vehicleMake, vehicleModel, vehicleYear].filter(Boolean).join(" ").trim();
+  const compatibilityValue = pickValue(values, ["compatibility", "vehicle_compatibility"]);
+  const compatibility = sanitizeCellValue(compatibilityValue) || [vehicleMake, vehicleModel, vehicleYear].filter(Boolean).join(" ").trim();
 
   const errors = [];
   if (!name) errors.push("Missing part name.");
   if (!partNumber) errors.push("Missing part number.");
   if (!brand) errors.push("Missing brand.");
-  if (!Number.isFinite(mrp) || mrp <= 0) errors.push("Invalid MRP in INR.");
+  if (!description) errors.push("Missing description.");
+  if (mrpValue === "") errors.push("Missing MRP.");
+  if (mrp !== null && (!Number.isFinite(mrp) || mrp <= 0)) errors.push("Invalid MRP in INR.");
   if (!Number.isFinite(price) || price <= 0) errors.push("Invalid selling price in INR.");
   if (!Number.isSafeInteger(moqValue) || moqValue <= 0) errors.push("Invalid MOQ.");
-  if (!Number.isSafeInteger(stockValue) || stockValue < 0) errors.push("Invalid availability.");
-  if (!compatibility) errors.push("Missing compatible vehicle.");
+  if (stockValue === "") errors.push("Missing availability / stock.");
+  if (stock !== null && (!Number.isSafeInteger(stock) || stock < 0)) errors.push("Invalid availability.");
+  if (quantity !== null && (!Number.isSafeInteger(quantity) || quantity < 0)) errors.push("Invalid quantity.");
 
   if (errors.length) {
     return { valid: false, errors };
   }
 
-  const productKey = buildVendorImportKey(vendorId, partNumber, brand);
   const product = {
     name,
     partNumber,
     brand,
     description,
     price: Number(price.toFixed(2)),
-    mrp: Number(mrp.toFixed(2)),
-    stock: Math.max(0, Math.round(stockValue)),
     moq: Math.max(1, Math.round(moqValue)),
-    compatibility,
     sellerType: "vendor",
     sellerId: String(vendorId || "").trim(),
     vendorSource: "bulk_import",
@@ -278,23 +307,42 @@ export function buildVendorImportProduct(row, vendorId) {
     status: "pending",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    vendorImportKey: productKey,
   };
+  if (mrp !== null) product.mrp = Number(mrp.toFixed(2));
+  if (stock !== null) product.stock = Math.max(0, Math.round(stock));
+  if (quantity !== null) product.quantity = Math.max(0, Math.round(quantity));
+  if (compatibility) product.compatibility = compatibility;
   const category = sanitizeCellValue(pickValue(values, ["category", "product_category", "category_name"]));
   if (category) product.category = category;
+  const productKey = buildVendorImportKey(vendorId, product);
+  product.vendorImportKey = productKey;
 
   return { valid: true, product, productKey };
 }
 
-export function buildVendorImportKey(vendorId, partNumber, brand) {
-  return `${String(vendorId || "").trim().toLowerCase()}|${String(partNumber || "").trim().toLowerCase()}|${String(brand || "").trim().toLowerCase()}`;
+function normalizeImportIdentityValue(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
+  return String(value ?? "").trim().replace(/\s+/g, " ");
 }
 
-export function buildVendorImportUpdate(existingProduct = {}, incomingProduct = {}, vendorId) {
-  const existingRecord = existingProduct && typeof existingProduct === "object" ? existingProduct : {};
+export function buildVendorImportKey(vendorId, product = {}) {
+  const identity = [
+    normalizeImportIdentityValue(product.partNumber),
+    normalizeImportIdentityValue(product.brand),
+    normalizeImportIdentityValue(product.description ?? product.name),
+    normalizeImportIdentityValue(product.mrp),
+    normalizeImportIdentityValue(product.price),
+    normalizeImportIdentityValue(product.stock),
+    normalizeImportIdentityValue(product.compatibility),
+    normalizeImportIdentityValue(product.category),
+  ];
+  const digest = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return `${String(vendorId || "").trim()}|${digest}`;
+}
+
+export function buildVendorImportCreate(incomingProduct = {}, vendorId) {
   const incomingRecord = incomingProduct && typeof incomingProduct === "object" ? incomingProduct : {};
   const timestamp = new Date().toISOString();
-
   const basePayload = { ...incomingRecord };
   delete basePayload.createdAt;
   delete basePayload.updatedAt;
@@ -306,33 +354,24 @@ export function buildVendorImportUpdate(existingProduct = {}, incomingProduct = 
   delete basePayload.vendorSource;
   delete basePayload.rowNumber;
   delete basePayload.updateExisting;
+  delete basePayload.alreadyExists;
 
-  const finalPayload = {
-    ...existingRecord,
+  return {
     ...basePayload,
+    createdAt: timestamp,
     updatedAt: timestamp,
-    sellerType: existingRecord.sellerType || "vendor",
-    sellerId: existingRecord.sellerId || String(vendorId || "").trim() || incomingRecord.sellerId || "",
-    vendorImportKey: incomingRecord.vendorImportKey || existingRecord.vendorImportKey,
-    vendorSource: incomingRecord.vendorSource || existingRecord.vendorSource || "bulk_import",
+    sellerType: "vendor",
+    sellerId: String(vendorId || "").trim() || incomingRecord.sellerId || "",
+    vendorImportKey: incomingRecord.vendorImportKey,
+    vendorSource: incomingRecord.vendorSource || "bulk_import",
+    enabled: false,
+    status: "pending",
   };
-
-  if (Object.keys(existingRecord).length === 0) {
-    finalPayload.createdAt = timestamp;
-    finalPayload.enabled = false;
-    finalPayload.status = "pending";
-    return finalPayload;
-  }
-
-  finalPayload.createdAt = existingRecord.createdAt || timestamp;
-  finalPayload.enabled = Object.prototype.hasOwnProperty.call(existingRecord, "enabled") ? existingRecord.enabled : false;
-  finalPayload.status = Object.prototype.hasOwnProperty.call(existingRecord, "status") ? existingRecord.status : "pending";
-  return finalPayload;
 }
 
 export function previewVendorBulkImport(rows, vendorId, existingKeys = []) {
   const seen = new Set();
-  const existing = new Set((existingKeys || []).map((key) => String(key).trim().toLowerCase()));
+  const existing = new Set((existingKeys || []).map((key) => String(key).trim()));
   const validRows = [];
   const invalidRows = [];
   let duplicates = 0;
@@ -347,18 +386,18 @@ export function previewVendorBulkImport(rows, vendorId, existingKeys = []) {
         continue;
       }
       if (seen.has(result.productKey)) {
-        invalidRows.push({ rowNumber, errors: ["Duplicate row within the same import file."] });
+        duplicates += 1;
         continue;
       }
       seen.add(result.productKey);
 
       if (existing.has(result.productKey)) {
         duplicates += 1;
-        validRows.push({ rowNumber, ...result.product, updateExisting: true });
+        validRows.push({ rowNumber, ...result.product, alreadyExists: true });
         continue;
       }
 
-      validRows.push({ rowNumber, ...result.product, updateExisting: false });
+      validRows.push({ rowNumber, ...result.product, alreadyExists: false });
     } catch (error) {
       invalidRows.push({ rowNumber, errors: [error.message || "Row is invalid."] });
     }

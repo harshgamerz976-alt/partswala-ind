@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import XLSX from "xlsx";
 import {
   BULK_IMPORT_LIMITS,
-  buildVendorImportUpdate,
+  buildVendorImportCreate,
   parseBulkImportFile,
   previewVendorBulkImport,
   REQUIRED_IMPORT_COLUMNS,
   generateVendorBulkImportTemplate,
   generateVendorBulkImportWorkbook,
+  isVendorBulkImportInputError,
+  OPTIONAL_IMPORT_COLUMNS,
 } from "./vendorBulkImport.js";
 
 test("vendor bulk import preview accepts valid rows and counts duplicates", () => {
@@ -20,16 +22,76 @@ test("vendor bulk import preview accepts valid rows and counts duplicates", () =
   const result = previewVendorBulkImport(payload, "vendor-1", []);
   assert.equal(result.totalRows, 2);
   assert.equal(result.validRows, 1);
-  assert.equal(result.invalidRows, 1);
-  assert.equal(result.errors[0].errors[0].includes("Duplicate"), true);
+  assert.equal(result.invalidRows, 0);
+  assert.equal(result.duplicates, 1);
   assert.deepEqual(result.rows[0].partNumber, "OF-100");
 
-  const reimport = previewVendorBulkImport([
-    { rowNumber: 2, values: { partNumber: "OF-100", brand: "Bosch", description: "Updated Oil Filter", mrp: "2699", price: "2199", stock: "18", compatibility: "Mahindra Bolero" } },
-  ], "vendor-1", ["vendor-1|of-100|bosch"]);
+  const sameProduct = { partNumber: "OF-100", brand: "Bosch", description: "Oil Filter", mrp: "2499", price: "1999", stock: "12", compatibility: "Mahindra Bolero" };
+  const existingKey = previewVendorBulkImport([sameProduct], "vendor-1").rows[0].vendorImportKey;
+  const reimport = previewVendorBulkImport([sameProduct], "vendor-1", [existingKey]);
   assert.equal(reimport.validRows, 1);
   assert.equal(reimport.duplicates, 1);
-  assert.equal(reimport.rows[0].updateExisting, true);
+  assert.equal(reimport.rows[0].alreadyExists, true);
+});
+
+test("duplicate identity includes each required field and supplied category and compatibility", () => {
+  const base = {
+    partNumber: "PN-100",
+    brand: "Acme",
+    description: "Original description",
+    mrp: "1500",
+    price: "1250",
+    stock: "5",
+    category: "Filters",
+    compatibility: "Volvo FM",
+  };
+  const changedFields = [
+    { partNumber: "PN-101" },
+    { brand: "Other brand" },
+    { description: "Different description" },
+    { mrp: "1501" },
+    { price: "1251" },
+    { stock: "6" },
+    { category: "Brakes" },
+    { compatibility: "Mahindra Bolero" },
+  ];
+
+  for (const change of changedFields) {
+    const result = previewVendorBulkImport([base, { ...base, ...change }], "vendor-1");
+    assert.equal(result.validRows, 2, `field change ${JSON.stringify(change)} should create a distinct product`);
+    assert.equal(result.duplicates, 0);
+    assert.equal(result.invalidRows, 0);
+  }
+});
+
+test("quantity is optional, excluded from duplicate identity, and never summed", () => {
+  const csv = [
+    "Part Number,Brand,Description,Selling Price,MRP,Availability / Stock,Quantity",
+    "PN-200,Acme,Clutch assembly,1250,1500,5,3",
+    "PN-200,Acme,Clutch assembly,1250,1500,5,9",
+  ].join("\n");
+  const parsed = parseBulkImportFile(Buffer.from(csv), "quantity.csv");
+  const result = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(result.validRows, 1);
+  assert.equal(result.duplicates, 1);
+  assert.equal(result.invalidRows, 0);
+  assert.equal(result.rows[0].stock, 5);
+  assert.equal(result.rows[0].quantity, 3);
+});
+
+test("blank optional category and compatible vehicle cells are accepted", () => {
+  const csv = [
+    "Part Number,Brand,Description,Selling Price,MRP,Availability / Stock,Category,Compatible Vehicle",
+    "PN-300,Acme,Clutch assembly,1250,1500,5,,",
+  ].join("\n");
+  const parsed = parseBulkImportFile(Buffer.from(csv), "blank-optionals.csv");
+  const result = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(result.validRows, 1);
+  assert.equal(result.invalidRows, 0);
+  assert.equal(Object.hasOwn(result.rows[0], "category"), false);
+  assert.equal(Object.hasOwn(result.rows[0], "compatibility"), false);
 });
 
 test("bulk upload parser rejects malformed, empty, and malicious spreadsheet content", () => {
@@ -47,8 +109,8 @@ function workbookBuffer(rows, bookType = "xlsx") {
 
 test("bulk import maps the required Excel and legacy XLS columns to product fields", () => {
   const rows = [
-    ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle"],
-    ["CP-440", "Valeo", "Clutch Plate", 5000, 4250, 8, "Volvo FM"],
+    ["Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock", "Compatible Vehicle", "Category"],
+    ["CP-440", "Valeo", "Clutch Plate", 4250, 5000, 8, "Volvo FM", "Clutch"],
   ];
 
   for (const [fileName, bookType] of [["parts.xlsx", "xlsx"], ["parts.xls", "biff8"]]) {
@@ -67,6 +129,7 @@ test("bulk import maps the required Excel and legacy XLS columns to product fiel
         price: preview.rows[0].price,
         stock: preview.rows[0].stock,
         compatibility: preview.rows[0].compatibility,
+        category: preview.rows[0].category,
       },
       {
         name: "Clutch Plate",
@@ -77,24 +140,164 @@ test("bulk import maps the required Excel and legacy XLS columns to product fiel
         price: 4250,
         stock: 8,
         compatibility: "Volvo FM",
+        category: "Clutch",
       },
     );
-    assert.equal(Object.prototype.hasOwnProperty.call(preview.rows[0], "category"), false);
   }
 });
 
-test("bulk import rejects missing required headers and values instead of inventing product data", () => {
-  assert.throws(
-    () => parseBulkImportFile(Buffer.from("Part Number,Brand,Description,Selling Price,Availability/Stock,Compatible Vehicle\nPN-1,Brand,Part,100,2,Vehicle\n"), "missing-mrp.csv"),
-    /missing required columns: mrp/i,
+test("bulk import parses valid CSV headers and maps the required product fields", () => {
+  const csv = [
+    "Part Number,Brand,Description,Selling Price,MRP,Availability / Stock",
+    "CSV-100,Acme,Clutch assembly,1250,1500,4",
+    "CSV-100,Acme,Clutch assembly,1250,1500,4",
+  ].join("\n");
+  const parsed = parseBulkImportFile(Buffer.from(csv), "parts.csv");
+  const preview = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(preview.validRows, 1);
+  assert.equal(preview.duplicates, 1);
+  assert.deepEqual(
+    {
+      partNumber: preview.rows[0].partNumber,
+      brand: preview.rows[0].brand,
+      description: preview.rows[0].description,
+      mrp: preview.rows[0].mrp,
+      price: preview.rows[0].price,
+      stock: preview.rows[0].stock,
+    },
+    {
+      partNumber: "CSV-100",
+      brand: "Acme",
+      description: "Clutch assembly",
+      mrp: 1500,
+      price: 1250,
+      stock: 4,
+    },
   );
+});
+
+test("bulk import accepts CSV with optional columns omitted", () => {
+  const csv = [
+    "Part Number,Brand,Description,Selling Price,MRP,Availability / Stock",
+    "CSV-101,Acme,Clutch assembly,1250,1500,4",
+  ].join("\n");
+  const parsed = parseBulkImportFile(Buffer.from(csv), "parts-minimal.csv");
+  const preview = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(preview.validRows, 1);
+  assert.equal(preview.rows[0].name, "Clutch assembly");
+  assert.equal(preview.rows[0].description, "Clutch assembly");
+  assert.equal(preview.rows[0].mrp, 1500);
+  assert.equal(preview.rows[0].stock, 4);
+  for (const field of ["compatibility", "category"]) {
+    assert.equal(Object.hasOwn(preview.rows[0], field), false);
+  }
+});
+
+test("bulk import maps all optional CSV columns when supplied", () => {
+  const csv = [
+    "Part Number,Brand,Description,Selling Price,MRP,Availability / Stock,Category,Compatible Vehicle",
+    "CSV-102,Acme,Clutch assembly,1250,1500,4,Clutch,Volvo FM",
+  ].join("\n");
+  const parsed = parseBulkImportFile(Buffer.from(csv), "parts-with-optionals.csv");
+  const preview = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(preview.validRows, 1);
+  assert.deepEqual(
+    {
+      name: preview.rows[0].name,
+      description: preview.rows[0].description,
+      price: preview.rows[0].price,
+      category: preview.rows[0].category,
+      compatibility: preview.rows[0].compatibility,
+      stock: preview.rows[0].stock,
+      mrp: preview.rows[0].mrp,
+    },
+    {
+      name: "Clutch assembly",
+      description: "Clutch assembly",
+      price: 1250,
+      category: "Clutch",
+      compatibility: "Volvo FM",
+      stock: 4,
+      mrp: 1500,
+    },
+  );
+});
+
+test("bulk import accepts XLSX with optional columns omitted", () => {
+  const workbook = workbookBuffer([
+    ["Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock"],
+    ["XLSX-101", "Acme", "Clutch assembly", 1250, 1500, 4],
+  ]);
+  const parsed = parseBulkImportFile(workbook, "parts-minimal.xlsx");
+  const preview = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(preview.validRows, 1);
+  assert.equal(preview.rows[0].name, "Clutch assembly");
+  assert.equal(preview.rows[0].description, "Clutch assembly");
+  assert.equal(preview.rows[0].price, 1250);
+  assert.equal(preview.rows[0].mrp, 1500);
+  assert.equal(preview.rows[0].stock, 4);
+  for (const field of ["compatibility", "category"]) {
+    assert.equal(Object.hasOwn(preview.rows[0], field), false);
+  }
+});
+
+test("bulk import maps all optional XLSX columns when supplied", () => {
+  const workbook = workbookBuffer([
+    ["Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock", "Category", "Compatible Vehicle"],
+    ["XLSX-102", "Acme", "Clutch assembly", 1250, 1500, 4, "Clutch", "Volvo FM"],
+  ]);
+  const parsed = parseBulkImportFile(workbook, "parts-with-optionals.xlsx");
+  const preview = previewVendorBulkImport(parsed, "vendor-1");
+
+  assert.equal(preview.validRows, 1);
+  assert.deepEqual(
+    {
+      name: preview.rows[0].name,
+      description: preview.rows[0].description,
+      price: preview.rows[0].price,
+      category: preview.rows[0].category,
+      compatibility: preview.rows[0].compatibility,
+      stock: preview.rows[0].stock,
+      mrp: preview.rows[0].mrp,
+    },
+    {
+      name: "Clutch assembly",
+      description: "Clutch assembly",
+      price: 1250,
+      category: "Clutch",
+      compatibility: "Volvo FM",
+      stock: 4,
+      mrp: 1500,
+    },
+  );
+});
+
+test("bulk import rejects missing required headers and values instead of inventing product data", () => {
+  const requiredHeaders = ["Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock"];
+  for (const [missingHeaderIndex, missingHeader] of requiredHeaders.entries()) {
+    let parseError;
+    const headers = requiredHeaders.filter((header) => header !== missingHeader);
+    const csv = `${headers.join(",")}\n${headers.map(() => "value").join(",")}\n`;
+    assert.throws(
+      () => parseBulkImportFile(Buffer.from(csv), `missing-required-${missingHeaderIndex}.csv`),
+      (error) => {
+        parseError = error;
+        return /missing required columns:/i.test(error.message);
+      },
+    );
+    assert.equal(isVendorBulkImportInputError(parseError), true);
+  }
+  assert.equal(isVendorBulkImportInputError(new Error("Firestore unavailable")), false);
 
   const result = previewVendorBulkImport([
-    { rowNumber: 2, values: { partNumber: "PN-1", brand: "Brand", description: "Part", price: "100", mrp: "", stock: "", compatibility: "" } },
+    { rowNumber: 2, values: { partNumber: "PN-1", brand: "Brand", description: "Part", price: "", mrp: "100", stock: "2" } },
   ], "vendor-1");
   assert.equal(result.validRows, 0);
-  assert.match(result.errors[0].errors.join(" "), /MRP/i);
-  assert.match(result.errors[0].errors.join(" "), /availability/i);
+  assert.match(result.errors[0].errors.join(" "), /selling price/i);
 });
 
 test("bulk import enforces file, row, and column limits before cell scanning", () => {
@@ -103,7 +306,7 @@ test("bulk import enforces file, row, and column limits before cell scanning", (
     /too large/i,
   );
 
-  const header = ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle"];
+  const header = ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle", "Category"];
   const tooManyRows = workbookBuffer([
     header,
     ...Array.from({ length: BULK_IMPORT_LIMITS.maxRows + 1 }, (_, index) => [
@@ -127,8 +330,8 @@ test("bulk import enforces file, row, and column limits before cell scanning", (
 
 test("bulk import rejects spreadsheet formulas", () => {
   const rows = [
-    ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle"],
-    ["CP-440", "Valeo", "Clutch Plate", 5000, 4250, 8, "Volvo FM"],
+    ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle", "Category"],
+    ["CP-440", "Valeo", "Clutch Plate", 5000, 4250, 8, "Volvo FM", "Clutch"],
   ];
   const workbook = XLSX.utils.book_new();
   const sheet = XLSX.utils.aoa_to_sheet(rows);
@@ -147,15 +350,23 @@ test("bulk imports reject invalid prices and missing required fields", () => {
   assert.equal(result.invalidRows, 2);
 });
 
-test("bulk imports require an explicit compatible vehicle value", () => {
+test("bulk imports accept omitted optional values and preserve validation for supplied values", () => {
   const result = previewVendorBulkImport([
-    { rowNumber: 2, values: { description: "Universal Part", partNumber: "U-1", brand: "Brand", mrp: "1000", price: "900", stock: "12", compatibility: "" } },
-    { rowNumber: 3, values: { description: "Vehicle Part", partNumber: "V-1", brand: "Brand", mrp: "1000", price: "900", stock: "12", compatibility: "Universal fit" } },
+    { rowNumber: 2, values: { description: "Universal Part", partNumber: "U-1", brand: "Brand", price: "900", mrp: "1000", stock: "2" } },
+    { rowNumber: 3, values: { description: "Invalid MRP", partNumber: "V-1", brand: "Brand", price: "900", mrp: "not-a-price", stock: "2" } },
+    { rowNumber: 4, values: { description: "Invalid Stock", partNumber: "W-1", brand: "Brand", price: "900", mrp: "1000", stock: "1.5" } },
+    { rowNumber: 5, values: { description: "Invalid Quantity", partNumber: "Q-1", brand: "Brand", price: "900", mrp: "1000", stock: "2", quantity: "1.5" } },
   ], "vendor-1");
 
   assert.equal(result.validRows, 1);
-  assert.equal(result.invalidRows, 1);
-  assert.match(result.errors[0].errors.join(" "), /compatible vehicle/i);
+  assert.equal(result.invalidRows, 3);
+  assert.equal(result.rows[0].name, "Universal Part");
+  assert.equal(result.rows[0].mrp, 1000);
+  assert.equal(result.rows[0].stock, 2);
+  assert.equal(Object.hasOwn(result.rows[0], "compatibility"), false);
+  assert.match(result.errors[0].errors.join(" "), /MRP/i);
+  assert.match(result.errors[1].errors.join(" "), /availability/i);
+  assert.match(result.errors[2].errors.join(" "), /quantity/i);
 });
 
 test("bulk imports reject malformed numeric strings and fractional stock instead of coercing them", () => {
@@ -180,22 +391,12 @@ test("cross-vendor matches remain valid creates and do not count as duplicates",
   ], "vendor-1", ["vendor-2|af-210|mann"]);
   assert.equal(result.validRows, 1);
   assert.equal(result.duplicates, 0);
-  assert.equal(result.rows[0].updateExisting, false);
+  assert.equal(result.rows[0].alreadyExists, false);
   assert.equal(result.rows[0].sellerId, "vendor-1");
 });
 
-test("bulk import update builder preserves protected fields on vendor-owned updates", () => {
-  const existing = {
-    sellerId: "vendor-1",
-    sellerType: "vendor",
-    status: "approved",
-    enabled: true,
-    createdAt: "2024-01-01T00:00:00.000Z",
-    vendorImportKey: "vendor-1|of-100|bosch",
-    vendorStatus: "approved",
-    adminReviewedBy: "admin-9",
-  };
-  const incoming = {
+test("bulk import create builder sets new listings pending and strips preview metadata", () => {
+  const product = {
     name: "Updated Oil Filter",
     partNumber: "OF-100",
     brand: "Bosch",
@@ -206,32 +407,31 @@ test("bulk import update builder preserves protected fields on vendor-owned upda
     moq: 12,
     compatibility: "Mahindra Bolero",
     vendorImportKey: "vendor-1|of-100|bosch",
+    rowNumber: 4,
+    alreadyExists: false,
   };
 
-  const merged = buildVendorImportUpdate(existing, incoming, "vendor-1");
-  assert.equal(merged.sellerId, "vendor-1");
-  assert.equal(merged.sellerType, "vendor");
-  assert.equal(merged.status, "approved");
-  assert.equal(merged.enabled, true);
-  assert.equal(merged.vendorStatus, "approved");
-  assert.equal(merged.adminReviewedBy, "admin-9");
-  assert.equal(merged.partNumber, "OF-100");
-  assert.equal(merged.name, "Updated Oil Filter");
-  assert.equal(Object.prototype.hasOwnProperty.call(merged, "rowNumber"), false);
-  assert.equal(Object.prototype.hasOwnProperty.call(merged, "updateExisting"), false);
-
-  const newProduct = buildVendorImportUpdate({}, incoming, "vendor-1");
-  assert.equal(newProduct.status, "pending");
-  assert.equal(newProduct.enabled, false);
-  assert.equal(newProduct.createdAt.length > 0, true);
+  const created = buildVendorImportCreate(product, "vendor-1");
+  assert.equal(created.sellerId, "vendor-1");
+  assert.equal(created.sellerType, "vendor");
+  assert.equal(created.status, "pending");
+  assert.equal(created.enabled, false);
+  assert.equal(created.partNumber, "OF-100");
+  assert.equal(created.name, "Updated Oil Filter");
+  assert.equal(Object.prototype.hasOwnProperty.call(created, "rowNumber"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(created, "alreadyExists"), false);
+  assert.equal(created.createdAt.length > 0, true);
 });
 
 test("template includes required product columns and max rows remains configurable", () => {
   const template = generateVendorBulkImportTemplate();
-  assert.deepEqual(REQUIRED_IMPORT_COLUMNS, ["partNumber", "brand", "description", "mrp", "price", "stock", "compatibility"]);
-  assert.doesNotMatch(template, /Category|MOQ|Part Name/);
+  assert.deepEqual(REQUIRED_IMPORT_COLUMNS, ["partNumber", "brand", "description", "price", "mrp", "stock"]);
+  assert.deepEqual(OPTIONAL_IMPORT_COLUMNS, ["category", "compatibility", "quantity"]);
+  const expectedHeaders = ["Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock", "Category", "Compatible Vehicle", "Quantity"];
+  assert.deepEqual(template.split(","), expectedHeaders);
+  assert.doesNotMatch(template, /MOQ|Part Name/);
   const workbook = XLSX.read(generateVendorBulkImportWorkbook(), { type: "buffer" });
   const headers = XLSX.utils.sheet_to_json(workbook.Sheets.Products, { header: 1 })[0];
-  assert.deepEqual(headers, ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle"]);
+  assert.deepEqual(headers, expectedHeaders);
   assert.ok(BULK_IMPORT_LIMITS.maxRows > 10);
 });

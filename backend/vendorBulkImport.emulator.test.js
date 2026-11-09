@@ -140,11 +140,16 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
     form.append("file", new Blob([workbook], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), fileName);
     if (confirm) form.append("confirm", "true");
     if (claimedVendorId) form.append("vendorId", claimedVendorId);
-    return fetch(`${api}/api/vendor/import-products`, {
+    const response = await fetch(`${api}/api/vendor/import-products`, {
       method: "POST",
       headers: { Authorization: `Bearer ${vendor.token}` },
       body: form,
     });
+    if (response.ok) {
+      const result = await response.clone().json();
+      createdProductIds.push(...(result.imported || []).map(({ id }) => id));
+    }
+    return response;
   }
 
   async function importOversizedFile(token) {
@@ -165,18 +170,21 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
   }
 
   const workbookRow = (name, partNumber, brand, price = "1250") => {
-    const workbook = XLSX.utils.book_new();
-    const sheet = XLSX.utils.aoa_to_sheet([
+    return workbookRows([
       ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle"],
       [partNumber, brand, name, 1500, price, 5, "Volvo FM"],
     ]);
-    XLSX.utils.book_append_sheet(workbook, sheet, "Products");
-    return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
   };
+
+  function workbookRows(rows) {
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), "Products");
+    return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  }
 
   async function deleteVendorData() {
     const references = [
-      ...createdProductIds.map((productId) => database.collection("products").doc(productId)),
+      ...new Set(createdProductIds).map((productId) => database.collection("products").doc(productId)),
       ...createdImportJobIds.map((jobId) => database.collection("vendorImportJobs").doc(jobId)),
     ];
     for (const uid of createdVendorIds) {
@@ -257,7 +265,7 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       const workbook = XLSX.read(Buffer.from(await response.arrayBuffer()), { type: "buffer" });
       assert.equal(workbook.SheetNames[0], "Products");
       assert.deepEqual(XLSX.utils.sheet_to_json(workbook.Sheets.Products, { header: 1 })[0], [
-        "Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability/Stock", "Compatible Vehicle",
+        "Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock", "Category", "Compatible Vehicle", "Quantity",
       ]);
     });
 
@@ -275,6 +283,21 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       assert.equal(malformed.status, 400);
       assert.match((await malformed.json()).message, /could not be read/i);
 
+      const requiredHeaders = ["Part Number", "Brand", "Description", "Selling Price", "MRP", "Availability / Stock"];
+      for (const missingHeader of requiredHeaders) {
+        const headers = requiredHeaders.filter((header) => header !== missingHeader);
+        const csv = `${headers.join(",")}\n${headers.map(() => "value").join(",")}\n`;
+        const missingHeaderResponse = await importFile(
+          vendor,
+          Buffer.from(csv),
+          false,
+          "",
+          `missing-${missingHeader.toLowerCase().replaceAll(" ", "-")}.csv`,
+        );
+        assert.equal(missingHeaderResponse.status, 400);
+        assert.match((await missingHeaderResponse.json()).message, /missing required columns:/i);
+      }
+
       const response = await importFile(vendor, workbookRow("Preview part", "PREVIEW-100", "Acme"), false, "forged-vendor-id");
       assert.equal(response.status, 200);
       const result = await response.json();
@@ -285,7 +308,7 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       assert.equal(result.rows[0].description, "Preview part");
       assert.equal(result.rows[0].mrp, 1500);
       assert.equal(result.rows[0].price, 1250);
-      assert.deepEqual(result.requiredColumns, ["partNumber", "brand", "description", "mrp", "price", "stock", "compatibility"]);
+      assert.deepEqual(result.requiredColumns, ["partNumber", "brand", "description", "price", "mrp", "stock"]);
       assert.equal((await database.collection("products").where("sellerId", "==", vendor.uid).get()).size, 0);
     });
 
@@ -338,7 +361,7 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       assert.equal(vendorAProducts.docs[0].data().name, "Vendor A product");
     });
 
-    await t.test("updates preserve ownership and protected approval fields", async () => {
+    await t.test("different product details create a separate listing without overwriting existing products", async () => {
       const vendor = await createVendor();
       const existing = await database.collection("products").add({
         sellerId: vendor.uid,
@@ -354,36 +377,62 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       });
       const response = await importFile(vendor, workbookRow("New name", "KEEP-100", "Acme", "2750"));
       assert.equal(response.status, 201);
-      const updated = (await existing.get()).data();
-      assert.equal(updated.sellerId, vendor.uid);
-      assert.equal(updated.sellerType, "vendor");
-      assert.equal(updated.status, "approved");
-      assert.equal(updated.enabled, true);
-      assert.equal(updated.approvedBy, "admin-test");
-      assert.equal(updated.createdAt, "2025-01-01T00:00:00.000Z");
-      assert.equal(updated.name, "New name");
-      assert.equal(updated.price, 2750);
-      assert.equal(updated.description, "New name");
-      assert.equal(updated.mrp, 1500);
+      const unchanged = (await existing.get()).data();
+      assert.equal(unchanged.sellerId, vendor.uid);
+      assert.equal(unchanged.status, "approved");
+      assert.equal(unchanged.enabled, true);
+      assert.equal(unchanged.approvedBy, "admin-test");
+      assert.equal(unchanged.createdAt, "2025-01-01T00:00:00.000Z");
+      assert.equal(unchanged.name, "Old name");
+      assert.equal(unchanged.price, 100);
+      assert.equal(unchanged.description, undefined);
+      assert.equal((await database.collection("products").where("sellerId", "==", vendor.uid).get()).size, 2);
     });
 
-    await t.test("repeated submissions update one listing and retain one import job", async () => {
+    await t.test("repeated submissions preserve existing listing data and retain one import job", async () => {
       const vendor = await createVendor();
       const workbook = workbookRow("Retry part", "RETRY-100", "Acme");
       const first = await importFile(vendor, workbook);
-      const second = await importFile(vendor, workbook);
       assert.equal(first.status, 201);
+      const firstResult = await first.json();
+      const productReference = database.collection("products").doc(firstResult.imported[0].id);
+      await productReference.update({ status: "approved", enabled: true, approvedBy: "admin-test" });
+      const second = await importFile(vendor, workbook);
       assert.equal(second.status, 201);
+      const secondResult = await second.json();
       const [products, jobs] = await Promise.all([
         database.collection("products").where("sellerId", "==", vendor.uid).get(),
         database.collection("vendorImportJobs").where("vendorId", "==", vendor.uid).get(),
       ]);
       assert.equal(products.size, 1);
       assert.equal(jobs.size, 1);
-      const [firstResult, secondResult] = await Promise.all([first.json(), second.json()]);
       assert.equal(firstResult.imported[0].id, secondResult.imported[0].id);
-      assert.equal(firstResult.imported[0].updateExisting, false);
-      assert.equal(secondResult.imported[0].updateExisting, true);
+      assert.equal(firstResult.imported[0].alreadyExists, false);
+      assert.equal(secondResult.imported[0].alreadyExists, true);
+      const preserved = (await productReference.get()).data();
+      assert.equal(preserved.status, "approved");
+      assert.equal(preserved.enabled, true);
+      assert.equal(preserved.approvedBy, "admin-test");
+    });
+
+    await t.test("identical rows import once while different descriptions create separate products", async () => {
+      const vendor = await createVendor();
+      const workbook = workbookRows([
+        ["Part Number", "Brand", "Description", "MRP", "Selling Price", "Availability / Stock", "Quantity"],
+        ["DUP-100", "Acme", "Same description", 1500, 1250, 5, 2],
+        ["DUP-100", "Acme", "Same description", 1500, 1250, 5, 9],
+        ["DUP-100", "Acme", "Different description", 1500, 1250, 5, 2],
+      ]);
+      const response = await importFile(vendor, workbook);
+      assert.equal(response.status, 201);
+      const result = await response.json();
+      assert.equal(result.summary.validRows, 2);
+      assert.equal(result.summary.duplicates, 1);
+      const products = await database.collection("products").where("sellerId", "==", vendor.uid).get();
+      assert.equal(products.size, 2);
+      assert.deepEqual(products.docs.map((document) => document.data().description).sort(), ["Different description", "Same description"]);
+      const sameDescription = products.docs.find((document) => document.data().description === "Same description").data();
+      assert.equal(sameDescription.quantity, 2);
     });
 
     await t.test("concurrent imports create only one vendor-scoped listing", async () => {
@@ -393,7 +442,9 @@ test("authenticated vendor bulk import routes use isolated Auth and Firestore em
       assert.deepEqual(responses.map((response) => response.status), [201, 201]);
       const products = await database.collection("products").where("sellerId", "==", vendor.uid).get();
       assert.equal(products.size, 1);
-      assert.equal(products.docs[0].data().vendorImportKey, `${vendor.uid.toLowerCase()}|concurrent-100|acme`);
+      const [identityVendorId, identityDigest] = products.docs[0].data().vendorImportKey.split("|");
+      assert.equal(identityVendorId, vendor.uid);
+      assert.match(identityDigest, /^[a-f0-9]{64}$/);
     });
     await t.test("selected approval is bounded and publishes only selected pending vendor products", async () => {
       const vendor = await createVendor();
