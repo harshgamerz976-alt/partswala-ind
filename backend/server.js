@@ -37,6 +37,11 @@ import {
   validateSupplierEnquiryInput,
   validateSupplierQuoteInput,
 } from "./vendorEnquiries.js";
+import {
+  createWhatsAppSimulator,
+  registerWhatsAppSimulatorRoutes,
+  registerWhatsAppWebhookRoutes,
+} from "./whatsappWebhook.js";
 import { redactAuditValue } from "./audit.js";
 import { firebaseIdTokenDiagnostics, verifyFirebaseIdToken } from "./authentication.js";
 import { hasAdminClaim } from "./adminAuthorization.js";
@@ -214,6 +219,56 @@ app.use((request, response, next) => {
 });
 app.use(createPreLaunchAccessPolicy({ now: () => getServerTimeMs() }));
 app.use(express.json({ limit: "1mb", verify: (request, _response, buffer) => { request.rawBody = Buffer.from(buffer); } }));
+registerWhatsAppWebhookRoutes(app, {
+  getDb,
+  env: process.env,
+  interpretMessage: ({ message, history, whatsappProfileName }) => interpretAssistantMessage({
+    apiKey: process.env.GEMINI_API_KEY,
+    model: process.env.GEMINI_MODEL,
+    groqApiKey: process.env.GROQ_API_KEY,
+    groqModel: process.env.GROQ_MODEL,
+    message,
+    history,
+    role: "customer",
+    channel: "whatsapp",
+    whatsappProfileName,
+  }),
+  answerQuestion: async (intent) => {
+    if (!canUseAssistantTool("customer", intent.action)) return "";
+    const data = await executeAssistantTool({
+      db: getDb(),
+      actor: { user: null, profile: null, role: "customer" },
+      tool: intent.action,
+      args: intent.args,
+      context: {},
+    });
+    return data.reply;
+  },
+  notifyTeam: notifyWhatsAppTeam,
+  authorizeAdmin: async (request) => {
+    const user = await verifyRequest(request);
+    return isAdminUser(user) ? user : null;
+  },
+  isMarketplaceOpen: () => isMarketplaceAvailable({ now: getServerTimeMs() }),
+});
+if (process.env.WHATSAPP_SIMULATOR_ENABLED === "true" && process.env.NODE_ENV === "development") {
+  const simulator = createWhatsAppSimulator({
+    interpretMessage: ({ message, history, whatsappProfileName }) => interpretAssistantMessage({
+      apiKey: process.env.GEMINI_API_KEY,
+      model: process.env.GEMINI_MODEL,
+      groqApiKey: process.env.GROQ_API_KEY,
+      groqModel: process.env.GROQ_MODEL,
+      message,
+      history,
+      role: "customer",
+      channel: "whatsapp",
+      whatsappProfileName,
+    }),
+    answerQuestion: async () => "Store settings are not connected in the local simulator. Ask me about a vehicle or part quote instead.",
+    isMarketplaceOpen: () => isMarketplaceAvailable({ now: getServerTimeMs() }),
+  });
+  registerWhatsAppSimulatorRoutes(app, { simulator, env: process.env });
+}
 
 function requireEnv(names) {
   const missing = names.filter((name) => !process.env[name]);
@@ -430,6 +485,52 @@ async function canUseNotificationsForUser(database, user) {
   if (isAdminUser(user)) return false;
   const snapshot = await database.collection("users").doc(user.uid).get();
   return snapshot.exists && canUseUserNotifications(snapshot.data(), false);
+}
+
+async function notifyWhatsAppTeam({ type, conversationId, enquiryId, eventId }) {
+  const teamUserIds = [...new Set(String(process.env.WHATSAPP_TEAM_USER_IDS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value && value.length <= 128))].slice(0, 20);
+  if (!teamUserIds.length) throw new Error("WhatsApp team recipients are not configured.");
+
+  const database = getDb();
+  const auth = getAuth(getFirebaseApp());
+  const messaging = isFcmPushEnabled() ? getMessaging(getFirebaseApp()) : null;
+  let notified = 0;
+  for (const recipientId of teamUserIds) {
+    const account = await auth.getUser(recipientId);
+    const authorized = isAdminUser({
+      admin: account.customClaims?.admin === true,
+      email: account.email,
+    });
+    if (!authorized) continue;
+
+    const notificationId = createHash("sha256")
+      .update(`whatsapp-team:${type}:${eventId}:${recipientId}`)
+      .digest("hex");
+    const humanRequest = type === "human-request";
+    await persistSupplierNotification({
+      database,
+      messaging,
+      recipientId,
+      notification: {
+        id: notificationId,
+        type: humanRequest ? "whatsapp-human-request" : "whatsapp-enquiry",
+        title: humanRequest ? "Customer requested WhatsApp support" : "New WhatsApp quote request",
+        message: humanRequest
+          ? "A customer requested help from a person."
+          : "A customer quote request is ready for review.",
+        productName: "WhatsApp request",
+        enquiryId: enquiryId || conversationId,
+        createdAt: new Date().toISOString(),
+        read: false,
+        link: `/admin?whatsappConversation=${encodeURIComponent(conversationId)}`,
+      },
+    });
+    notified += 1;
+  }
+  if (!notified) throw new Error("No authorized WhatsApp team recipient is available.");
 }
 
 async function recordSupplierNotification(database, recipientId, type, eventKey, productName, enquiryId, createdAt) {

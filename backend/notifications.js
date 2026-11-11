@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { canCreateSupplierEnquiry } from "./vendorEnquiries.js";
 
 const TOKEN_LIMIT = 4096;
-const ALLOWED_LINKS = new Set(["/my-enquiries", "/vendor/enquiries"]);
+const ALLOWED_LINKS = new Set(["/my-enquiries", "/vendor/enquiries", "/admin"]);
 const SUPPLIER_NOTIFICATION_TYPES = new Set(["vendor-enquiry", "customer-reply"]);
 
 function cleanText(value, maxLength) {
