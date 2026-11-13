@@ -1,69 +1,179 @@
-import { useState, useEffect } from "react";
-import { getProductsPage } from "../services/productService";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import ProductCard from "../components/productcard";
+import "./Products.css";
+import { filterProducts, getProductsPage } from "../services/productService";
+import { createCatalogRequestVersion } from "../services/catalogRequestVersion";
+import {
+  normalizeCatalogFilters,
+  parseCatalogFilters,
+  serializeCatalogFilters,
+} from "../services/productCatalog";
+
+const PAGE_SIZE = 20;
 
 export default function Products() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const queryString = searchParams.toString();
+  const filters = useMemo(() => {
+    return normalizeCatalogFilters(parseCatalogFilters(queryString));
+  }, [queryString]);
+  const filterKey = serializeCatalogFilters(filters);
+  const requestFiltersKey = serializeCatalogFilters({ ...filters, sortBy: "newest" });
+  const requestFilters = useMemo(() => parseCatalogFilters(requestFiltersKey), [requestFiltersKey]);
+  const isCanonicalQuery = queryString === filterKey;
+  const [draftFilters, setDraftFilters] = useState(filters);
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [selectedCategory, setSelectedCategory] = useState("All");
-  const [searchQuery, setSearchQuery] = useState("");
+  const [error, setError] = useState("");
+  const [loadMoreError, setLoadMoreError] = useState("");
+  const [hasMoreProducts, setHasMoreProducts] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [compareItems, setCompareItems] = useState([]);
   const [isCompareOpen, setIsCompareOpen] = useState(false);
   const [compareMessage, setCompareMessage] = useState("");
-  const [productsCursor, setProductsCursor] = useState(null);
-  const [hasMoreProducts, setHasMoreProducts] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-
-  async function loadMoreProducts() {
-    if (!productsCursor || !hasMoreProducts || loadingMore) return;
-    setLoadingMore(true);
-    try {
-      const page = await getProductsPage(productsCursor);
-      setProducts((previous) => [...previous, ...page.products]);
-      setProductsCursor(page.cursor);
-      setHasMoreProducts(page.hasMore);
-    } catch (err) {
-      console.error("More catalogue products could not be loaded:", err);
-    } finally {
-      setLoadingMore(false);
-    }
-  }
-
-  async function loadInitialProducts() {
-    setLoading(true);
-    try {
-      const page = await getProductsPage();
-      setProducts(page.products);
-      setProductsCursor(page.cursor);
-      setHasMoreProducts(page.hasMore);
-    } catch (err) {
-      console.error("Error fetching products for storefront:", err);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const cursorRef = useRef(null);
+  const hasMoreRef = useRef(false);
+  const loadingMoreRef = useRef(false);
+  const requestVersionRef = useRef(null);
+  if (!requestVersionRef.current) requestVersionRef.current = createCatalogRequestVersion();
+  const pageRequestControllerRef = useRef(null);
+  const loadMoreRequestControllerRef = useRef(null);
+  const filtersRef = useRef(filters);
+  const compareDialogRef = useRef(null);
+  const closeCompareRef = useRef(null);
+  const compareTriggerRef = useRef(null);
+  filtersRef.current = filters;
 
   useEffect(() => {
-    loadInitialProducts();
-  }, []);
+    setDraftFilters(filters);
+  }, [filterKey, filters]);
 
-  // 1. Dynamic category generation to ensure strict string matches
-  const categories = ["All", ...new Set(products.map((p) => p.category).filter(Boolean))];
+  useEffect(() => {
+    if (isCanonicalQuery) return;
+    setSearchParams(filterKey, { replace: true });
+  }, [filterKey, isCanonicalQuery, setSearchParams]);
 
-  // Search and category controls narrow the currently loaded catalogue pages.
-  const filteredProducts = products.filter((p) => {
-    const matchesCategory = selectedCategory === "All" || p.category === selectedCategory;
-    const matchesSearch = 
-      `${p.name || ""} ${p.brand || ""} ${p.partNumber || ""}`
-        .toLowerCase()
-        .includes(searchQuery.toLowerCase());
+  useEffect(() => {
+    if (!isCanonicalQuery) return undefined;
 
-    return matchesCategory && matchesSearch;
-  });
+    const requestVersion = requestVersionRef.current.begin();
+    const controller = new AbortController();
+    pageRequestControllerRef.current = controller;
+    loadMoreRequestControllerRef.current?.abort();
+    loadMoreRequestControllerRef.current = null;
+    cursorRef.current = null;
+    hasMoreRef.current = false;
+    loadingMoreRef.current = false;
+    setProducts([]);
+    setLoading(true);
+    setError("");
+    setLoadMoreError("");
+    setHasMoreProducts(false);
+    setLoadingMore(false);
 
-  function resetFilters() {
-    setSelectedCategory("All");
-    setSearchQuery("");
+    getProductsPage(null, PAGE_SIZE, requestFilters, { signal: controller.signal })
+      .then((page) => {
+        if (!requestVersionRef.current.isCurrent(requestVersion)) return;
+        setProducts(page.products);
+        cursorRef.current = page.cursor;
+        hasMoreRef.current = page.hasMore;
+        setHasMoreProducts(page.hasMore);
+      })
+      .catch((fetchError) => {
+        if (fetchError.name === "AbortError") return;
+        console.error("Error fetching products for storefront:", fetchError);
+        if (requestVersionRef.current.isCurrent(requestVersion)) setError("Products could not be loaded. Please try again.");
+      })
+      .finally(() => {
+        if (requestVersionRef.current.isCurrent(requestVersion)) setLoading(false);
+      });
+
+    return () => {
+      controller.abort();
+      loadMoreRequestControllerRef.current?.abort();
+      if (pageRequestControllerRef.current === controller) pageRequestControllerRef.current = null;
+      requestVersionRef.current.invalidate(requestVersion);
+    };
+  }, [isCanonicalQuery, requestFilters, requestFiltersKey]);
+
+  useEffect(() => {
+    if (!isCompareOpen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeCompareRef.current?.focus();
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") setIsCompareOpen(false);
+      if (event.key !== "Tab") return;
+      const dialog = compareDialogRef.current;
+      const focusableItems = dialog?.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+      if (!focusableItems?.length) return;
+      const firstItem = focusableItems[0];
+      const lastItem = focusableItems[focusableItems.length - 1];
+      if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        firstItem.focus();
+      } else if (event.shiftKey && document.activeElement === firstItem) {
+        event.preventDefault();
+        lastItem.focus();
+      } else if (!event.shiftKey && document.activeElement === lastItem) {
+        event.preventDefault();
+        firstItem.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+      compareTriggerRef.current?.focus();
+    };
+  }, [isCompareOpen]);
+
+  const filteredProducts = useMemo(() => filterProducts(products, filters), [products, filters]);
+
+  function loadMoreProducts() {
+    if (!cursorRef.current || !hasMoreRef.current || loadingMoreRef.current) return;
+    const requestVersion = requestVersionRef.current.current();
+    const cursor = cursorRef.current;
+    const requestFilters = filtersRef.current;
+    const controller = new AbortController();
+    loadMoreRequestControllerRef.current = controller;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    setLoadMoreError("");
+
+    getProductsPage(cursor, PAGE_SIZE, requestFilters, { signal: controller.signal })
+      .then((page) => {
+        if (!requestVersionRef.current.isCurrent(requestVersion)) return;
+        setProducts((previous) => {
+          const existingIds = new Set(previous.map((product) => product.id));
+          return [...previous, ...page.products.filter((product) => !existingIds.has(product.id))];
+        });
+        cursorRef.current = page.cursor;
+        hasMoreRef.current = page.hasMore;
+        setHasMoreProducts(page.hasMore);
+      })
+      .catch((fetchError) => {
+        if (fetchError.name === "AbortError") return;
+        console.error("More catalogue products could not be loaded:", fetchError);
+        if (requestVersionRef.current.isCurrent(requestVersion)) setLoadMoreError("More products could not be loaded. Please try again.");
+      })
+      .finally(() => {
+        if (requestVersionRef.current.isCurrent(requestVersion)) {
+          loadingMoreRef.current = false;
+          setLoadingMore(false);
+          if (loadMoreRequestControllerRef.current === controller) loadMoreRequestControllerRef.current = null;
+        }
+      });
+  }
+
+  function applyFilters(event) {
+    event.preventDefault();
+    setSearchParams(serializeCatalogFilters(draftFilters));
+  }
+
+  function clearSearch() {
+    setSearchParams(serializeCatalogFilters({ ...draftFilters, search: "" }));
   }
 
   function toggleCompare(product) {
@@ -78,83 +188,92 @@ export default function Products() {
     });
   }
 
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center gap-3">
-        <div className="w-8 h-8 border-4 border-orange-500 border-t-transparent rounded-full animate-spin"></div>
-        <p className="text-slate-400 text-sm font-medium">Loading heavy duty components...</p>
-      </div>
-    );
+  function openCompare() {
+    compareTriggerRef.current = document.activeElement;
+    setIsCompareOpen(true);
   }
+
+  const searchActive = Boolean(filters.search);
 
   return (
     <div className="products-page min-h-screen bg-slate-950 text-slate-100 max-w-7xl mx-auto px-4 md:px-8 py-10">
-      
-      {/* Header Section */}
       <div className="products-page-header mb-8">
         <div>
           <p className="featured-eyebrow">THE COMPLETE DEPOT / 03</p>
           <h1 className="text-3xl font-black tracking-wide text-white">Truck parts catalogue</h1>
-          <p className="text-slate-400 text-sm">Browse genuine commercial vehicle spares and OEM replacements.</p>
+          <p className="text-slate-400 text-sm">Search and browse every eligible listing in the live product catalogue.</p>
         </div>
-        <div className="products-total"><strong>{filteredProducts.length}</strong><span>parts shown</span></div>
+        <div className="products-total"><strong>{filteredProducts.length}</strong><span>matching parts loaded</span></div>
       </div>
+      <form className="products-toolbar mb-8 grid grid-cols-1 md:grid-cols-3 gap-4 bg-slate-900/60 p-4 rounded-2xl border border-slate-800/80" onSubmit={applyFilters}>
+          <label className="catalog-field md:col-span-2">
+            <span>Search all parts by name, brand, part number, or compatibility</span>
+            <input type="search" value={draftFilters.search} onChange={(event) => setDraftFilters((previous) => ({ ...previous, search: event.target.value }))} maxLength={120} />
+          </label>
+          <label className="catalog-field">
+            <span>Category</span>
+            <input type="search" value={draftFilters.category} onChange={(event) => setDraftFilters((previous) => ({ ...previous, category: event.target.value }))} maxLength={120} />
+          </label>
+          <label className="catalog-field">
+            <span>Compatibility</span>
+            <input type="search" value={draftFilters.compatibility} onChange={(event) => setDraftFilters((previous) => ({ ...previous, compatibility: event.target.value }))} maxLength={120} />
+          </label>
+          <label className="catalog-field">
+            <span>Availability</span>
+            <select value={draftFilters.stockStatus} onChange={(event) => setDraftFilters((previous) => ({ ...previous, stockStatus: event.target.value }))}>
+              <option value="all">Any availability</option>
+              <option value="in-stock">In stock</option>
+              <option value="out-of-stock">Out of stock</option>
+              <option value="unknown">Availability not listed</option>
+            </select>
+          </label>
+          <label className="catalog-field">
+            <span>Sort loaded matches</span>
+            <select value={draftFilters.sortBy} onChange={(event) => setDraftFilters((previous) => ({ ...previous, sortBy: event.target.value }))}>
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="price-low">Price: low to high</option>
+              <option value="price-high">Price: high to low</option>
+              <option value="discount">Verified discount: high to low</option>
+            </select>
+          </label>
+          <div className="catalog-filter-actions md:col-span-3">
+            <button type="submit" className="products-reset">Search catalogue</button>
+            {searchActive && <button type="button" onClick={clearSearch} className="products-reset products-reset-secondary">Clear search</button>}
+          </div>
+          <p className="catalog-filter-note md:col-span-3">
+            Search checks eligible listings across the catalogue. Results load in pages; sorting and the count apply to loaded matches.
+          </p>
+      </form>
 
-      {/* Filter and Search controls bar */}
-      <div className="products-toolbar grid grid-cols-1 md:grid-cols-3 gap-4 mb-8 bg-slate-900/60 p-4 rounded-2xl border border-slate-800/80">
-        <div className="md:col-span-2 flex flex-wrap gap-2 items-center">
-          {categories.map((cat) => (
-            <button
-              key={cat}
-              onClick={() => setSelectedCategory(cat)}
-              className={`px-4 py-2 rounded-xl text-xs font-bold uppercase border transition-all ${
-                selectedCategory === cat 
-                  ? "bg-orange-500 text-white border-transparent shadow-lg shadow-orange-500/10" 
-                  : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
-              }`}
-            >
-              {cat === "All" ? "🌐 All Spares" : cat}
-            </button>
-          ))}
-        </div>
-        
-        <div className="products-search-wrap">
-          <input
-            type="text"
-            placeholder="Search loaded parts by name, brand, or part number..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm focus:border-orange-500 focus:outline-none placeholder-slate-600"
-          />
-          {(searchQuery || selectedCategory !== "All") && (
-            <button type="button" onClick={resetFilters} className="products-reset">Clear filters</button>
-          )}
-        </div>
-      </div>
-
-      {/* Grid Display Area */}
-      {filteredProducts.length === 0 ? (
+      {loading ? (
+        <div role="status" className="text-center py-20 text-slate-400">Loading eligible product listings…</div>
+      ) : error ? (
+        <div className="featured-empty" role="alert">{error}</div>
+      ) : filteredProducts.length === 0 ? (
         <div className="text-center py-20 bg-slate-900 rounded-2xl border border-slate-800/60">
-          <span className="text-4xl">📦</span>
-          <h3 className="text-lg font-bold text-slate-300 mt-4">No matching truck parts found</h3>
-          <p className="text-slate-500 text-sm mt-1">Try another category or reset your search.</p>
-          <button type="button" onClick={resetFilters} className="products-reset products-reset-empty">Show all parts</button>
+          <h2 className="text-lg font-bold text-slate-300">No matching parts found</h2>
+          <p className="text-slate-500 text-sm mt-2">
+            {hasMoreProducts ? "More catalogue results are available; continue loading to browse." : "No eligible listing matched this search."}
+          </p>
+          {searchActive && <button type="button" onClick={clearSearch} className="products-reset products-reset-empty">Clear search</button>}
         </div>
       ) : (
         <div className="products-grid grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-            {filteredProducts.map((product) => (
+          {filteredProducts.map((product) => (
             <ProductCard key={product.id} product={product} onCompare={toggleCompare} isCompared={compareItems.some((item) => item.id === product.id)} />
           ))}
         </div>
       )}
 
-      {hasMoreProducts && <div className="flex justify-center py-8"><button type="button" onClick={loadMoreProducts} disabled={loadingMore} className="products-reset">{loadingMore ? "Loading parts..." : "Load more parts"}</button></div>}
+      {loadMoreError && <p className="catalog-load-error" role="alert">{loadMoreError}</p>}
+      {hasMoreProducts && <div className="flex justify-center py-8"><button type="button" onClick={loadMoreProducts} disabled={loading || loadingMore} className="products-reset">{loadingMore ? "Loading parts…" : "Load more catalogue results"}</button></div>}
 
       {compareItems.length > 0 && (
         <div className="compare-tray">
           <div><strong>Compare parts</strong><span>{compareItems.length}/3 selected</span></div>
-          <div className="compare-tray-items">{compareItems.map((item) => <span key={item.id}>{item.name || item.title}<button type="button" onClick={() => toggleCompare(item)} aria-label={`Remove ${item.name || item.title}`}>×</button></span>)}</div>
-          <button type="button" className="compare-open-button" disabled={compareItems.length < 2} onClick={() => setIsCompareOpen(true)}>Compare now <span>↗</span></button>
+          <div className="compare-tray-items">{compareItems.map((item) => <span key={item.id}>{item.name || item.title}<button type="button" onClick={() => toggleCompare(item)} aria-label={`Remove ${item.name || item.title} from comparison`}>×</button></span>)}</div>
+          <button ref={compareTriggerRef} type="button" className="compare-open-button" disabled={compareItems.length < 2} onClick={openCompare}>Compare now <span>↗</span></button>
         </div>
       )}
 
@@ -162,20 +281,19 @@ export default function Products() {
 
       {isCompareOpen && (
         <div className="compare-modal-backdrop" onClick={() => setIsCompareOpen(false)}>
-          <section className="compare-modal" onClick={(event) => event.stopPropagation()}>
-            <header><div><p className="featured-eyebrow">PART MATCH / 01</p><h2>Compare selected parts</h2></div><button type="button" onClick={() => setIsCompareOpen(false)} aria-label="Close comparison">×</button></header>
+          <section ref={compareDialogRef} className="compare-modal" role="dialog" aria-modal="true" aria-labelledby="compare-title" onClick={(event) => event.stopPropagation()}>
+            <header><div><p className="featured-eyebrow">PART MATCH / 01</p><h2 id="compare-title">Compare selected parts</h2></div><button ref={closeCompareRef} type="button" onClick={() => setIsCompareOpen(false)} aria-label="Close comparison">×</button></header>
             <div className="compare-table">
               <div className="compare-label-column"><span>Part</span><span>Brand</span><span>Category</span><span>Part number</span><span>Selling price</span><span>MRP</span><span>Stock</span></div>
-              {compareItems.map((item) => <div className="compare-product-column" key={item.id}><strong>{item.name || item.title}</strong><span>{item.brand || "Generic"}</span><span>{item.category || "Other"}</span><span>{item.partNumber || "Not listed"}</span><b>{money(item.price)}</b><span>{item.mrp ? money(item.mrp) : "Not listed"}</span><span className={Number(item.stock || 0) > 0 ? "compare-in-stock" : "compare-out-stock"}>{Number(item.stock || 0) > 0 ? `${item.stock} available` : "Out of stock"}</span><button type="button" onClick={() => toggleCompare(item)}>Remove</button></div>)}
+              {compareItems.map((item) => <div className="compare-product-column" key={item.id}><strong>{item.name || item.title}</strong><span>{item.brand || "Not listed"}</span><span>{item.category || "Not listed"}</span><span>{item.partNumber || "Not listed"}</span><b>{money(item.price)}</b><span>{item.mrp == null ? "Not listed" : money(item.mrp)}</span><span className={item.stock > 0 ? "compare-in-stock" : item.stock === 0 ? "compare-out-stock" : ""}>{item.stock == null ? "Not listed" : item.stock > 0 ? `${item.stock} available` : "Out of stock"}</span><button type="button" onClick={() => toggleCompare(item)}>Remove</button></div>)}
             </div>
           </section>
         </div>
       )}
-
     </div>
   );
 }
 
 function money(value) {
-  return `₹${Number(value || 0).toLocaleString("en-IN")}`;
+  return typeof value === "number" && Number.isFinite(value) ? `₹${value.toLocaleString("en-IN")}` : "Not listed";
 }

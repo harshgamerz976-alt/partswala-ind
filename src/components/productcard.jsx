@@ -3,6 +3,7 @@ import { useState } from "react";
 import SupplierEnquiryDialog from "./SupplierEnquiryDialog";
 import { useAuth } from "../context/useAuth";
 import { Link } from "react-router-dom";
+import { getResponsiveProductImage } from "../services/productImage";
 
 // Tick sound generator
 function playTickSound() {
@@ -28,6 +29,7 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
   const showToast = auth?.showToast;
   const [enquiryOpen, setEnquiryOpen] = useState(false);
   const isVendorListing = String(product.sellerType || "").toLowerCase() === "vendor";
+  const productImage = getResponsiveProductImage(product.imageUrl);
 
   const isOutOfStock = product.stock === 0 || product.stockCount === 0;
   const badgeText = product.badge || (product.tags?.includes("bestseller") ? "BEST SELLER" : "POPULAR");
@@ -149,8 +151,14 @@ export default function ProductCard({ product, onCompare, isCompared = false }) 
           {/* Image */}
           {product.imageUrl ? (
             <img
-              src={product.imageUrl}
+              src={productImage?.src || product.imageUrl}
+              srcSet={productImage?.srcSet || undefined}
+              sizes={productImage?.sizes || undefined}
               alt={product.name || product.title}
+              loading="lazy"
+              decoding="async"
+              width={480}
+              height={360}
               className="max-h-full max-w-full object-contain relative z-10 group-hover:scale-105 transition-transform duration-500 ease-out mix-blend-multiply dark:mix-blend-normal"
             />
           ) : (
