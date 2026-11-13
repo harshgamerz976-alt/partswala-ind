@@ -38,6 +38,11 @@ import {
   validateSupplierQuoteInput,
 } from "./vendorEnquiries.js";
 import { redactAuditValue } from "./audit.js";
+import { productUpdateWithoutPrivateFields, sanitizePublicProduct } from "./productPrivacy.js";
+import { publicProductCatalogIndexFields, publicProductCatalogIndexUpdate } from "./publicProductCatalogIndex.js";
+import { registerPublicProductCatalogRoutes } from "./publicProductCatalogRoutes.js";
+import { refreshVendorProductSearchIndex } from "./vendorProductSearchIndex.js";
+import { registerVendorApplicationDecisionRoute } from "./vendorApplicationDecisionRoute.js";
 import { firebaseIdTokenDiagnostics, verifyFirebaseIdToken } from "./authentication.js";
 import { hasAdminClaim } from "./adminAuthorization.js";
 import {
@@ -348,10 +353,12 @@ async function releaseInventoryReservation(transaction, db, order, timestamp) {
   const productSnapshots = await Promise.all(productRefs.map((reference) => transaction.get(reference)));
   const stockByProductId = Object.fromEntries(productSnapshots.map((snapshot) => [snapshot.id, snapshot.exists ? snapshot.data()?.stock : NaN]));
   if (productSnapshots.some((snapshot) => !snapshot.exists)) throw new Error("RESERVED_PRODUCT_NOT_FOUND");
+  const productsById = new Map(productSnapshots.map((snapshot) => [snapshot.id, snapshot.data()]));
   const restocks = planInventoryRestock(items, stockByProductId);
   restocks.forEach(({ productId, stock }) => {
     const reference = db.collection("products").doc(productId);
-    transaction.update(reference, { stock, updatedAt: timestamp });
+    const update = publicProductCatalogIndexUpdate(productId, productsById.get(productId), { stock, updatedAt: timestamp });
+    transaction.update(reference, productUpdateWithoutPrivateFields(update, FieldValue.delete()));
   });
   return true;
 }
@@ -752,6 +759,7 @@ function normalizeCustomer(payload, user) {
 }
 app.get("/health", (_request, response) => response.json({ ok: true, service: "partswala-ind-backend" }));
 registerPublicSettingsRoute(app, getDb);
+registerPublicProductCatalogRoutes(app, { getDb, resolveClientIp });
 
 app.get("/api/products/:productId/vendor-contact", async (request, response) => {
   const productId = String(request.params.productId || "").trim();
@@ -1589,8 +1597,10 @@ app.post("/api/orders", async (request, response) => {
       } catch {
         throw new Error("A product went out of stock while your order was being created. Refresh your cart and try again.");
       }
+      const productsById = new Map(inventorySnapshots.map((snapshot) => [snapshot.id, snapshot.data()]));
       reservationPlan.forEach(({ productId, stock }) => {
-        transaction.update(db.collection("products").doc(productId), { stock, updatedAt: createdAt });
+        const update = publicProductCatalogIndexUpdate(productId, productsById.get(productId), { stock, updatedAt: createdAt });
+        transaction.update(db.collection("products").doc(productId), productUpdateWithoutPrivateFields(update, FieldValue.delete()));
       });
       if (couponApplication && couponCounterRef && couponUsageRef) {
         transaction.set(couponCounterRef, { usageCount: couponCounter + 1, updatedAt: createdAt }, { merge: true });
@@ -1847,12 +1857,16 @@ app.patch("/api/admin/returns", async (request, response) => {
         const stock = Number(product.stock);
         if (!Number.isInteger(stock) || stock < 0) throw new Error("RETURN_PRODUCT_STOCK_INVALID");
         if (inspection.condition === "RESELLABLE") {
-          transaction.update(productSnapshot.ref, { stock: stock + inspection.quantity, updatedAt: timestamp });
+          const update = publicProductCatalogIndexUpdate(productSnapshot.id, product, { stock: stock + inspection.quantity, updatedAt: timestamp });
+          transaction.update(productSnapshot.ref, productUpdateWithoutPrivateFields(update, FieldValue.delete()));
           return;
         }
         const quarantinedStock = Number(product.quarantinedStock || 0);
         if (!Number.isInteger(quarantinedStock) || quarantinedStock < 0) throw new Error("RETURN_QUARANTINE_STOCK_INVALID");
-        transaction.update(productSnapshot.ref, { quarantinedStock: quarantinedStock + inspection.quantity, updatedAt: timestamp });
+        transaction.update(productSnapshot.ref, productUpdateWithoutPrivateFields(
+          { quarantinedStock: quarantinedStock + inspection.quantity, updatedAt: timestamp },
+          FieldValue.delete(),
+        ));
       });
       if (status === "rejected") {
         settlementSnapshots.forEach((snapshot, index) => {
@@ -2007,8 +2021,15 @@ app.post("/api/vendor/import-products", bulkImportUpload.single("file"), async (
           throw new Error("IMPORT_PRODUCT_IDENTITY_CONFLICT");
         }
         const payload = buildVendorImportUpdate(existingProduct || {}, product, user.uid);
-        if (snapshot.exists) transaction.update(reference, payload);
-        else transaction.create(reference, payload);
+        if (snapshot.exists) {
+          const indexedPayload = publicProductCatalogIndexUpdate(reference.id, existingProduct, payload, vendor);
+          transaction.update(reference, productUpdateWithoutPrivateFields(indexedPayload, FieldValue.delete()));
+        } else {
+          transaction.create(reference, {
+            ...payload,
+            ...publicProductCatalogIndexFields(reference.id, payload, vendor),
+          });
+        }
         return { id: reference.id, updateExisting: Boolean(existingProduct) };
       });
       imported.push({ ...result, partNumber: product.partNumber, brand: product.brand });
@@ -2183,8 +2204,9 @@ app.post("/api/admin/products", async (request, response) => {
     const productRef = db.collection("products").doc();
     const costRef = db.collection("productCosts").doc(productRef.id);
     const timestamp = new Date().toISOString();
-    const productData = { ...product, price, mrp, stock, weight, updatedAt: timestamp, createdAt: timestamp };
+    const productData = sanitizePublicProduct({ ...product, price, mrp, stock, weight, updatedAt: timestamp, createdAt: timestamp });
     delete productData.costPrice;
+    Object.assign(productData, publicProductCatalogIndexFields(productRef.id, productData));
     await db.runTransaction(async (transaction) => {
       transaction.create(productRef, productData);
       if (productData.sellerType === "partswala" && request.body.costPrice != null && request.body.costPrice !== "") transaction.create(costRef, { costPrice: Number(request.body.costPrice), updatedAt: timestamp });
@@ -2212,13 +2234,14 @@ app.put("/api/admin/products/:productId", async (request, response) => {
     const productRef = db.collection("products").doc(String(request.params.productId));
     const costRef = db.collection("productCosts").doc(productRef.id);
     const timestamp = new Date().toISOString();
-    const productData = { ...product, price, mrp, stock, weight, updatedAt: timestamp };
+    const productData = sanitizePublicProduct({ ...product, price, mrp, stock, weight, updatedAt: timestamp });
     delete productData.costPrice;
     await db.runTransaction(async (transaction) => {
       const [productSnapshot, costSnapshot] = await Promise.all([transaction.get(productRef), transaction.get(costRef)]);
       if (!productSnapshot.exists) throw new Error("PRODUCT_NOT_FOUND");
       const oldValue = productAuditValue(productSnapshot.data());
-      transaction.update(productRef, productData);
+      const indexedProduct = publicProductCatalogIndexUpdate(productRef.id, productSnapshot.data(), productData);
+      transaction.update(productRef, productUpdateWithoutPrivateFields(indexedProduct, FieldValue.delete()));
       const costPrice = request.body.costPrice;
       if (productData.sellerType === "partswala" && costPrice != null && costPrice !== "") transaction.set(costRef, { costPrice: Number(costPrice), updatedAt: timestamp });
       else if (costSnapshot.exists) transaction.delete(costRef);
@@ -2264,7 +2287,9 @@ app.patch("/api/admin/products/:productId/enabled", async (request, response) =>
       const snapshot = await transaction.get(productRef);
       if (!snapshot.exists) throw new Error("PRODUCT_NOT_FOUND");
       const enabled = request.body?.enabled === true;
-      transaction.update(productRef, { enabled, status: enabled ? "Available" : "Disabled", updatedAt: timestamp });
+      const changes = { enabled, status: enabled ? "Available" : "Disabled", updatedAt: timestamp };
+      const indexedProduct = publicProductCatalogIndexUpdate(productRef.id, snapshot.data(), changes);
+      transaction.update(productRef, productUpdateWithoutPrivateFields(indexedProduct, FieldValue.delete()));
       stageAdminAudit(transaction, db, user, { action: enabled ? "product_enabled" : "product_disabled", entityType: "product", entityId: productRef.id, oldValue: { enabled: snapshot.data().enabled !== false }, newValue: { enabled }, reason: String(request.body.reason || ""), timestamp });
     });
     return response.json({ ok: true });
@@ -2355,12 +2380,14 @@ app.post("/api/admin/products/approve-selected", async (request, response) => {
           }
 
           const businessName = String(vendor.vendorProfile?.businessName || vendor.displayName || "").trim();
-          transaction.update(productRef, {
+          const changes = {
             enabled: true,
             status: "Available",
             ...(businessName ? { vendorName: businessName, vendorBusinessName: businessName } : {}),
             updatedAt: timestamp,
-          });
+          };
+          const indexedProduct = publicProductCatalogIndexUpdate(productRef.id, product, changes, vendor);
+          transaction.update(productRef, productUpdateWithoutPrivateFields(indexedProduct, FieldValue.delete()));
           stageAdminAudit(transaction, db, user, {
             action: "product_enabled",
             entityType: "product",
@@ -2458,8 +2485,12 @@ app.patch("/api/admin/vendor-submissions/:submissionId", async (request, respons
         createdAt: existingProductSnapshot?.data()?.createdAt || timestamp,
         updatedAt: timestamp,
       };
-      if (existingProductSnapshot?.exists) transaction.update(productRef, product);
-      else transaction.create(productRef, product);
+      if (existingProductSnapshot?.exists) {
+        const indexedProduct = publicProductCatalogIndexUpdate(productRef.id, existingProductSnapshot.data(), product, vendor);
+        transaction.update(productRef, productUpdateWithoutPrivateFields(indexedProduct, FieldValue.delete()));
+      } else {
+        transaction.create(productRef, { ...product, ...publicProductCatalogIndexFields(productRef.id, product, vendor) });
+      }
       transaction.set(db.collection("vendorProductLinks").doc(submissionRef.id), { productId: productRef.id, vendorId: data.sellerId, vendorName: product.vendorName, submissionId: submissionRef.id, approvedBy: user.uid, approvedAt: timestamp });
       transaction.update(submissionRef, { status, approvedProductId: productRef.id, approvedBy: user.uid, reviewedBy: user.uid, reviewedAt: timestamp, rejectionReason: "", reviewHistory: [...(data.reviewHistory || []), { status, reviewedBy: user.uid, reviewedAt: timestamp }] });
       stageAdminAudit(transaction, db, user, { action: "vendor_product_published", entityType: "product", entityId: productRef.id, oldValue: existingProductSnapshot?.exists ? productAuditValue(existingProductSnapshot.data()) : null, newValue: productAuditValue(product), reason: `Approved vendor submission ${submissionRef.id}`, timestamp });
@@ -2472,33 +2503,12 @@ app.patch("/api/admin/vendor-submissions/:submissionId", async (request, respons
   }
 });
 
-app.patch("/api/admin/vendor-applications/:vendorId", async (request, response) => {
-  const user = await authenticatedUser(request, response);
-  if (!user) return;
-  if (!isAdminUser(user)) return response.status(403).json({ message: "Admin access required." });
-  const status = String(request.body?.status || "").toLowerCase();
-  const reason = String(request.body?.reason || "").trim().slice(0, 1000);
-  if (!["approved", "rejected"].includes(status) || (status === "rejected" && !reason)) return response.status(400).json({ message: "Choose a valid decision and provide a rejection reason." });
-  try {
-    const db = getDb();
-    const vendorId = String(request.params.vendorId);
-    const applicationRef = db.collection("vendorApplications").doc(vendorId);
-    const userRef = db.collection("users").doc(vendorId);
-    const timestamp = new Date().toISOString();
-    await db.runTransaction(async (transaction) => {
-      const [applicationSnapshot, userSnapshot] = await Promise.all([transaction.get(applicationRef), transaction.get(userRef)]);
-      if (!applicationSnapshot.exists || applicationSnapshot.data()?.status !== "pending") throw new Error("APPLICATION_NOT_PENDING");
-      const application = applicationSnapshot.data();
-      const oldUser = userSnapshot.exists ? userSnapshot.data() : {};
-      transaction.update(applicationRef, { status, reviewedAt: timestamp, reviewedBy: user.uid, rejectionReason: status === "rejected" ? reason : "" });
-      if (status === "approved") transaction.set(userRef, { role: "vendor", vendorStatus: "approved", vendorApprovedAt: timestamp, vendorApprovedBy: user.uid, vendorProfile: { businessName: application.businessName, ownerName: application.ownerName, email: application.email, phone: application.phone, businessAddress: application.businessAddress, city: application.city, state: application.state, pincode: application.pincode, gstin: application.gstin || "", pan: application.pan || "" } }, { merge: true });
-      else transaction.set(userRef, { vendorStatus: "rejected" }, { merge: true });
-      stageAdminAudit(transaction, db, user, { action: status === "approved" ? "vendor_enabled" : "vendor_disabled", entityType: "vendor", entityId: vendorId, oldValue: { role: oldUser.role || null, vendorStatus: oldUser.vendorStatus || null }, newValue: { role: status === "approved" ? "vendor" : oldUser.role || null, vendorStatus: status }, reason, timestamp });
-    });
-    return response.json({ ok: true, status });
-  } catch (error) {
-    return response.status(error.message === "APPLICATION_NOT_PENDING" ? 409 : 500).json({ message: error.message || "Vendor application review failed." });
-  }
+registerVendorApplicationDecisionRoute(app, {
+  getDb,
+  authenticatedUser,
+  isAdminUser,
+  stageAdminAudit,
+  refreshVendorProductSearchIndex,
 });
 
 app.put("/api/admin/settings/store", async (request, response) => {
@@ -3653,6 +3663,7 @@ app.post("/api/orders/cancel-items", async (request, response) => {
       const productRefs = selectedLines.map((item) => db.collection("products").doc(String(item.productId)));
       const productSnapshots = await Promise.all(productRefs.map((reference) => transaction.get(reference)));
       if (productSnapshots.some((snapshot) => !snapshot.exists)) throw new Error("CANCELLATION_PRODUCT_NOT_FOUND");
+      const productsById = new Map(productSnapshots.map((snapshot) => [snapshot.id, snapshot.data()]));
       const settlementRefs = selectedLines.filter((item) => item.settlementId).map((item) => db.collection("vendorSettlements").doc(item.settlementId));
       const settlementSnapshots = await Promise.all(settlementRefs.map((reference) => transaction.get(reference)));
       const settlementById = new Map(settlementSnapshots.map((snapshot) => [snapshot.id, snapshot]));
@@ -3750,7 +3761,11 @@ app.post("/api/orders/cancel-items", async (request, response) => {
       const refundRequestId = `cancel_${cancellationKey}`;
       const refundRef = db.collection("refundRequests").doc(cancellationKey);
       const paidOrder = order.paymentStatus === "Paid" || order.paymentStatus === "COD collected";
-      stockPlan.forEach(({ productId, stock }) => transaction.update(db.collection("products").doc(productId), { stock, updatedAt: timestamp }));
+      stockPlan.forEach(({ productId, stock }) => {
+        const product = productsById.get(productId) || {};
+        const update = publicProductCatalogIndexUpdate(productId, product, { stock, updatedAt: timestamp });
+        transaction.update(db.collection("products").doc(productId), productUpdateWithoutPrivateFields(update, FieldValue.delete()));
+      });
       for (const item of selectedLines) {
         if (!item.settlementId) continue;
         const settlementSnapshot = settlementById.get(item.settlementId);

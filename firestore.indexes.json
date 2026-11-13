@@ -54,6 +54,62 @@
         { "fieldPath": "productId", "mode": "ASCENDING" },
         { "fieldPath": "createdAt", "mode": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "products",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "catalogEligible", "mode": "ASCENDING" },
+        { "fieldPath": "catalogAvailability", "mode": "ASCENDING" },
+        { "fieldPath": "__name__", "mode": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "products",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "catalogEligible", "mode": "ASCENDING" },
+        { "fieldPath": "catalogCategory", "mode": "ASCENDING" },
+        { "fieldPath": "__name__", "mode": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "products",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "catalogEligible", "mode": "ASCENDING" },
+        { "fieldPath": "catalogCategory", "mode": "ASCENDING" },
+        { "fieldPath": "catalogAvailability", "mode": "ASCENDING" },
+        { "fieldPath": "__name__", "mode": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "products",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "catalogCategory", "mode": "ASCENDING" },
+        { "fieldPath": "catalogSearchNgrams", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "__name__", "mode": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "products",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "catalogAvailability", "mode": "ASCENDING" },
+        { "fieldPath": "catalogSearchNgrams", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "__name__", "mode": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "products",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "catalogCategory", "mode": "ASCENDING" },
+        { "fieldPath": "catalogAvailability", "mode": "ASCENDING" },
+        { "fieldPath": "catalogSearchNgrams", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "__name__", "mode": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []
